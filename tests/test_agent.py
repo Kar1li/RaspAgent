@@ -1,7 +1,20 @@
 import pytest
-from livekit.agents import AgentSession, ToolError, inference, llm
+from livekit.agents import AgentSession, ToolError, inference, llm, stt
 
-from agent import Assistant, SenseHatReader
+from agent import (
+    Assistant,
+    DataFlowLogger,
+    SenseHatReader,
+    StatusDisplay,
+    TranscriptCorrector,
+    build_audio_input_options,
+    build_session_llm,
+    build_session_stt,
+    build_session_tts,
+    build_turn_detection,
+)
+from inworld_stt import InworldSTT
+from local_stt import VoskSTT
 
 
 def _llm() -> llm.LLM:
@@ -37,6 +50,7 @@ class _FakeSenseHat:
         self.stick = _FakeStick()
         self.colour = _FakeColourSensor()
         self.gamma = [0, 1, 2]
+        self.pixels = []
 
     def get_temperature(self):
         return 22.456
@@ -79,6 +93,9 @@ class _FakeSenseHat:
 
     def get_pixels(self):
         return [[1, 2, 3]] * 64
+
+    def set_pixels(self, pixels):
+        self.pixels = pixels
 
 
 def test_sensehat_reader_returns_all_sensor_categories() -> None:
@@ -129,6 +146,10 @@ def test_assistant_exposes_sensehat_tools() -> None:
         "get_sensehat_light",
         "get_sensehat_display",
         "get_sensehat_snapshot",
+        "search_memory",
+        "list_memories",
+        "forget_memory",
+        "forget_all_memories",
     }.issubset(tool_ids)
 
 
@@ -141,6 +162,199 @@ def test_sensehat_errors_are_reported_as_tool_errors() -> None:
 
     with pytest.raises(ToolError):
         assistant._read_sense_hat("environment")
+
+
+def test_status_display_writes_led_pattern() -> None:
+    sense = _FakeSenseHat()
+    display = StatusDisplay(sense)
+
+    display.set_state("stt")
+
+    assert display.current_state == "stt"
+    assert len(sense.pixels) == 64
+    assert any(pixel != [0, 0, 0] for pixel in sense.pixels)
+
+
+def test_status_display_restores_previous_state() -> None:
+    sense = _FakeSenseHat()
+    display = StatusDisplay(sense)
+
+    display.set_state("in_room")
+    with display.showing("memory_retrieve"):
+        assert display.current_state == "memory_retrieve"
+
+    assert display.current_state == "in_room"
+
+
+def test_transcript_corrector_fixes_sensehat_domain_terms() -> None:
+    corrector = TranscriptCorrector(llm_enabled=False)
+
+    corrected = corrector.correct_deterministic(
+        "what is the sunset temperature on the raspberry pie"
+    )
+
+    assert corrected == "what is the Sense HAT temperature on the Raspberry Pi"
+
+
+@pytest.mark.asyncio
+async def test_final_stt_event_is_corrected() -> None:
+    assistant = Assistant(transcript_corrector=TranscriptCorrector(llm_enabled=False))
+    event = stt.SpeechEvent(
+        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+        alternatives=[stt.SpeechData(language="en", text="read sunset pressure")],
+    )
+
+    corrected = await assistant._correct_stt_event(event)
+
+    assert corrected.alternatives[0].text == "read Sense HAT pressure"
+
+
+@pytest.mark.asyncio
+async def test_stt_correction_is_logged_to_data_flow(tmp_path) -> None:
+    log_path = tmp_path / "data_flow.jsonl"
+    assistant = Assistant(
+        transcript_corrector=TranscriptCorrector(llm_enabled=False),
+        data_flow=DataFlowLogger(path=log_path),
+    )
+    event = stt.SpeechEvent(
+        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+        alternatives=[stt.SpeechData(language="en", text="read sunset pressure")],
+    )
+
+    await assistant._correct_stt_event(event)
+
+    assert '"event": "stt_correction"' in log_path.read_text(encoding="utf-8")
+    assert '"original_stt": "read sunset pressure"' in log_path.read_text(
+        encoding="utf-8"
+    )
+    assert '"corrected_stt": "read Sense HAT pressure"' in log_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_data_flow_logger_truncates_long_text(tmp_path) -> None:
+    log_path = tmp_path / "data_flow.jsonl"
+    flow = DataFlowLogger(path=log_path, max_text_chars=4)
+
+    flow.write("llm_output", text="abcdef")
+
+    assert "abcd...[truncated 2 chars]" in log_path.read_text(encoding="utf-8")
+
+
+def test_default_session_stt_is_local_vosk(monkeypatch) -> None:
+    monkeypatch.delenv("STT_PROVIDER", raising=False)
+    monkeypatch.setattr("agent.configured_vosk_model_path", lambda: ".models/test")
+    monkeypatch.setattr("agent.load_vosk_model", lambda path: object())
+    proc_userdata = {}
+
+    selected = build_session_stt(proc_userdata)
+
+    assert isinstance(selected, VoskSTT)
+    assert "vosk_model" in proc_userdata
+
+
+def test_session_stt_can_use_external_provider(monkeypatch) -> None:
+    monkeypatch.setenv("STT_PROVIDER", "livekit_inference")
+
+    selected = build_session_stt({})
+
+    assert selected.provider == "livekit"
+
+
+def test_session_stt_can_use_inworld(monkeypatch) -> None:
+    monkeypatch.setenv("STT_PROVIDER", "inworld")
+    monkeypatch.setenv("INWORLD_API_KEY", "test-key")
+    monkeypatch.setenv("INWORLD_STT_MODEL", "inworld/inworld-stt-test")
+
+    selected = build_session_stt({})
+
+    assert isinstance(selected, InworldSTT)
+    assert selected.provider == "inworld"
+    assert selected.model == "inworld/inworld-stt-test"
+
+
+def test_default_session_tts_uses_livekit_inference(monkeypatch) -> None:
+    monkeypatch.delenv("TTS_PROVIDER", raising=False)
+    monkeypatch.setenv("TTS_MODEL", "inworld/inworld-tts-1.5-max")
+    monkeypatch.setenv("TTS_VOICE", "Ashley")
+    monkeypatch.setenv("LIVEKIT_API_KEY", "test-key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "test-secret")
+
+    selected = build_session_tts()
+
+    assert selected.provider == "livekit"
+    assert selected.model == "inworld/inworld-tts-1.5-max"
+
+
+def test_session_tts_can_use_inworld(monkeypatch) -> None:
+    monkeypatch.setenv("TTS_PROVIDER", "inworld")
+    monkeypatch.setenv("INWORLD_API_KEY", "test-key")
+    monkeypatch.setenv("INWORLD_TTS_MODEL", "inworld-tts-1.5-max")
+    monkeypatch.setenv("INWORLD_TTS_VOICE", "Ashley")
+
+    selected = build_session_tts()
+
+    assert selected.provider == "Inworld"
+    assert selected.model == "inworld-tts-1.5-max"
+
+
+def test_turn_detection_is_disabled_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("TURN_DETECTION_ENABLED", raising=False)
+
+    assert build_turn_detection() is None
+
+
+def test_audio_enhancement_is_disabled_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("AUDIO_ENHANCEMENT_PROVIDER", raising=False)
+
+    options = build_audio_input_options()
+
+    assert options.noise_cancellation is None
+
+
+def test_default_session_llm_uses_openai_compatible_provider(monkeypatch) -> None:
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "test/model")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.example.test/v1")
+
+    selected = build_session_llm()
+
+    assert selected.model == "test/model"
+    assert selected.provider == "llm.example.test"
+
+
+def test_session_llm_falls_back_to_openrouter_env(monkeypatch) -> None:
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "test/model")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://openrouter.example.test/api/v1")
+
+    selected = build_session_llm()
+
+    assert selected.model == "test/model"
+    assert selected.provider == "openrouter.example.test"
+
+
+def test_session_llm_requires_model(monkeypatch) -> None:
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://llm.example.test/v1")
+
+    with pytest.raises(RuntimeError, match="LLM_MODEL"):
+        build_session_llm()
+
+
+def test_session_llm_can_use_livekit_inference(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_PROVIDER", "livekit_inference")
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-4.1-mini")
+
+    selected = build_session_llm()
+
+    assert selected.provider == "livekit"
 
 
 @pytest.mark.asyncio

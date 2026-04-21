@@ -1,0 +1,1 @@
+{"timestamp": "2026-04-20T14:00:03.848206+00:00", "event": "stt_correction", "original_stt": "read sunset pressure", "stt_correction_channel": "deterministic", "deterministic_stt": "read Sense HAT pressure", "corrected_stt": "read Sense HAT pressure", "correction_llm_model": null, "elapsed_ms": 0.04}
