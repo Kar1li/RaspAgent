@@ -11,7 +11,7 @@ from collections.abc import AsyncIterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -42,8 +42,8 @@ from local_stt import VoskSTT, configured_vosk_model_path, load_vosk_model
 from memory import (
     ContextController,
     DisabledContextController,
+    ProactiveAction,
     call_default_llm_node,
-    has_memory_note,
     latest_user_message,
     records_for_tool,
 )
@@ -520,6 +520,19 @@ STATUS_PATTERNS: dict[str, list[Pixel]] = {
         ],
         {"P": PURPLE},
     ),
+    "proactive": _pattern(
+        [
+            "..TTTT..",
+            ".T....T.",
+            ".T....T.",
+            "..TTTT..",
+            "...TT...",
+            "..T..T..",
+            ".T....T.",
+            "T......T",
+        ],
+        {"T": TEAL},
+    ),
     "memory_insert": _pattern(
         [
             "...G....",
@@ -585,6 +598,18 @@ class StatusDisplay:
     @property
     def current_state(self) -> str | None:
         return self._current_state
+
+    @property
+    def is_processing(self) -> bool:
+        return self._current_state in {
+            "stt",
+            "llm",
+            "tts",
+            "memory_insert",
+            "memory_retrieve",
+            "sensehat_tool",
+            "proactive",
+        }
 
     @property
     def sense_hat(self) -> Any:
@@ -683,7 +708,7 @@ class TranscriptCorrector:
         channel = "none" if deterministic == text else "deterministic"
         corrected = deterministic
 
-        if self._llm_enabled and STT_CORRECTION_TRIGGER.search(text):
+        if self._llm_enabled: 
             llm_result = await self._correct_with_llm(deterministic)
             if llm_result:
                 corrected = llm_result
@@ -879,6 +904,13 @@ class Assistant(Agent):
             When the user asks about the Raspberry Pi Sense HAT, sensor readings, local temperature, humidity, pressure, orientation, movement, compass direction, light, brightness, colour, joystick input, or LED display state, use the Sense HAT tools before answering.
             Do not answer questions about current sensor values from memory or general knowledge. Current Sense HAT readings require a Sense HAT tool call.
             When the user asks you to remember something, or asks what you remember, use the memory tools and answer plainly.
+            When the user wants to inspect or configure proactive reminders, quiet hours, current activity, or recent reminder history, use the structured status tools.
+            Use set_water_reminder_interval when the user changes only the water reminder cadence.
+            Use set_check_in_interval when the user changes only the proactive check in cadence.
+            Use update_user_profile when the user explicitly gives their preferred name or timezone.
+            Use get_reminder_policy when the user asks about one reminder type specifically.
+            Do not snooze reminders unless the user explicitly says later, snooze, or asks for a delay.
+            Do not change quiet hours unless the user explicitly mentions a time range.
             Sensor tool values are live readings from the device. State the units clearly and keep the answer short enough for voice.
             Your responses are concise, to the point, and without any complex formatting or punctuation including emojis, asterisks, or other symbols.
             You are curious, friendly, and have a sense of humor.""",
@@ -899,13 +931,11 @@ class Assistant(Agent):
         await self._context_controller.observe_user_turn(
             text, turn_id=getattr(new_message, "id", None)
         )
-        build_memory_note = getattr(self._context_controller, "build_memory_note", None)
-        if text and build_memory_note and not has_memory_note(turn_ctx):
-            with self._status_display.showing("memory_retrieve"):
-                note = await build_memory_note(text)
-                if note:
-                    turn_ctx.add_message(role="assistant", content=note)
-                    logger.info("Injected memory context in user-turn hook")
+        self._data_flow.write(
+            "user_turn_completed",
+            text=text,
+            turn_id=getattr(new_message, "id", None),
+        )
 
     async def stt_node(
         self,
@@ -987,6 +1017,13 @@ class Assistant(Agent):
                 chat_ctx,
                 latest_user_text=latest_text,
             )
+            logger.info(
+                "LLM controlled context ready",
+                extra={
+                    "context_items": len(controlled_ctx.items),
+                    "latest_user_chars": len(latest_text or ""),
+                },
+            )
             llm_model = _configured_llm_model_for_log()
             self._data_flow.write(
                 "llm_input",
@@ -1038,6 +1075,9 @@ class Assistant(Agent):
                 text="".join(tts_parts).strip(),
                 elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2),
             )
+            self._context_controller.record_assistant_speech(
+                text="".join(tts_parts).strip()
+            )
         finally:
             self._status_display.pop_state()
             logger.info("TTS node finished")
@@ -1055,12 +1095,18 @@ class Assistant(Agent):
                         "keys": ",".join(result.keys()) if isinstance(result, dict) else "",
                     },
                 )
+                self._data_flow.write(
+                    "sensehat_tool",
+                    category=category,
+                    result=result,
+                )
                 return result
         except Exception as exc:
             logger.exception("Unable to read Sense HAT %s data", category)
             raise ToolError(
                 "I could not read the Sense HAT right now. Check that the Sense HAT is attached, enabled, and that the `sense_hat` Python package is available to this process."
             ) from exc
+
 
     @function_tool()
     async def get_sensehat_environment(self, context: RunContext) -> dict[str, Any]:
@@ -1117,6 +1163,626 @@ class Assistant(Agent):
         return self._read_sense_hat("all")
 
     @function_tool()
+    async def get_status_summary(self, context: RunContext) -> dict[str, Any]:
+        """Inspect the agent's structured proactive status and reminder state.
+
+        Use this when the user asks about reminder settings, quiet hours, current activity, recent reminder counts, or what proactive state is currently stored.
+        """
+
+        tool_name = "get_status_summary"
+        self._log_tool_call_received(tool_name)
+        result = self._context_controller.status_summary()
+        self._data_flow.write("status_tool_summary", result=result)
+        self._log_tool_completed(tool_name, operation="status_summary", result=result)
+        return result
+
+    def _log_tool_call_received(self, tool_name: str, **raw_args: Any) -> None:
+        logger.info("Structured tool call received", extra={"tool_name": tool_name, "raw_args": raw_args})
+        self._data_flow.write("tool_call_received", tool_name=tool_name, raw_args=raw_args)
+
+    def _log_tool_arguments_normalized(
+        self,
+        tool_name: str,
+        *,
+        normalized_args: dict[str, Any],
+        operation: str,
+    ) -> None:
+        logger.info(
+            "Structured tool arguments normalized",
+            extra={
+                "tool_name": tool_name,
+                "operation": operation,
+                "normalized_args": normalized_args,
+            },
+        )
+        self._data_flow.write(
+            "tool_arguments_normalized",
+            tool_name=tool_name,
+            operation=operation,
+            normalized_args=normalized_args,
+        )
+
+    def _log_tool_completed(
+        self,
+        tool_name: str,
+        *,
+        operation: str,
+        result: Any,
+        stored: dict[str, Any] | None = None,
+    ) -> None:
+        logger.info(
+            "Structured tool completed",
+            extra={
+                "tool_name": tool_name,
+                "operation": operation,
+                "stored": stored or {},
+            },
+        )
+        self._data_flow.write(
+            "tool_completed",
+            tool_name=tool_name,
+            operation=operation,
+            stored=stored or {},
+            result=result,
+        )
+
+    def _tool_error(self, tool_name: str, exc: Exception) -> ToolError:
+        message = str(exc) or "Invalid tool arguments"
+        logger.warning(
+            "Structured tool validation failed",
+            extra={
+                "tool_name": tool_name,
+                "error_type": type(exc).__name__,
+                "error_message": message,
+            },
+        )
+        self._data_flow.write(
+            "tool_validation_failed",
+            tool_name=tool_name,
+            error_type=type(exc).__name__,
+            error_message=message,
+        )
+        self._data_flow.write(
+            "tool_completed_error",
+            tool_name=tool_name,
+            error_type=type(exc).__name__,
+            error_message=message,
+        )
+        return ToolError(message)
+
+    @function_tool()
+    async def set_water_reminder_interval(
+        self,
+        context: RunContext,
+        interval_minutes: int,
+    ) -> dict[str, Any]:
+        """Set the drink water reminder cadence.
+
+        Use this only when the user changes how often water reminders should happen. This updates the water reminder interval and enables that reminder. Do not use it for snoozing or quiet hours.
+        """
+
+        tool_name = "set_water_reminder_interval"
+        self._log_tool_call_received(tool_name, interval_minutes=interval_minutes)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="set_water_interval",
+            normalized_args={"interval_minutes": interval_minutes},
+        )
+        try:
+            result = self._context_controller.set_water_reminder_interval(interval_minutes)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        policy = result.get("policies", {}).get("drink_water", {})
+        self._log_tool_completed(
+            tool_name,
+            operation="set_water_interval",
+            stored={
+                "reminder_type": "drink_water",
+                "enabled": policy.get("enabled"),
+                "interval_minutes": policy.get("interval_minutes"),
+                "water_cooldown_until": result.get("runtime", {}).get("water_cooldown_until"),
+            },
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def set_check_in_interval(
+        self,
+        context: RunContext,
+        interval_minutes: int,
+    ) -> dict[str, Any]:
+        """Set the proactive check in cadence.
+
+        Use this only when the user changes how often proactive check ins should happen. This updates the check in interval and enables that reminder. Do not use it for snoozing or quiet hours.
+        """
+
+        tool_name = "set_check_in_interval"
+        self._log_tool_call_received(tool_name, interval_minutes=interval_minutes)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="set_check_in_interval",
+            normalized_args={"interval_minutes": interval_minutes},
+        )
+        try:
+            result = self._context_controller.set_check_in_interval(interval_minutes)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        policy = result.get("policies", {}).get("check_in", {})
+        self._log_tool_completed(
+            tool_name,
+            operation="set_check_in_interval",
+            stored={
+                "reminder_type": "check_in",
+                "enabled": policy.get("enabled"),
+                "interval_minutes": policy.get("interval_minutes"),
+                "check_in_cooldown_until": result.get("runtime", {}).get("check_in_cooldown_until"),
+            },
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def set_reminder_enabled(
+        self,
+        context: RunContext,
+        reminder_type: Literal["drink_water", "nap", "check_in"],
+        enabled: bool,
+    ) -> dict[str, Any]:
+        """Enable or disable one reminder type.
+
+        Use this when the user explicitly asks to turn drink water, nap, or check in reminders on or off. Do not use it for cadence changes, snoozing, or quiet hours.
+        """
+
+        tool_name = "set_reminder_enabled"
+        self._log_tool_call_received(tool_name, reminder_type=reminder_type, enabled=enabled)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="set_enabled",
+            normalized_args={"reminder_type": reminder_type, "enabled": enabled},
+        )
+        try:
+            result = self._context_controller.set_reminder_enabled(reminder_type, enabled)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        policy = result.get("policies", {}).get(reminder_type, {})
+        self._log_tool_completed(
+            tool_name,
+            operation="set_enabled",
+            stored={
+                "reminder_type": reminder_type,
+                "enabled": policy.get("enabled"),
+                "interval_minutes": policy.get("interval_minutes"),
+            },
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def get_reminder_policy(
+        self,
+        context: RunContext,
+        reminder_type: Literal["drink_water", "nap", "check_in"],
+    ) -> dict[str, Any]:
+        """Read one reminder policy.
+
+        Use this when the user asks specifically about the water, nap, or check in reminder settings rather than asking for the whole status summary.
+        """
+
+        tool_name = "get_reminder_policy"
+        self._log_tool_call_received(tool_name, reminder_type=reminder_type)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="get_reminder_policy",
+            normalized_args={"reminder_type": reminder_type},
+        )
+        try:
+            result = self._context_controller.get_reminder_policy(reminder_type)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        self._log_tool_completed(
+            tool_name,
+            operation="get_reminder_policy",
+            stored={"reminder_type": reminder_type},
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def snooze_reminder(
+        self,
+        context: RunContext,
+        reminder_type: Literal["drink_water", "nap", "check_in"],
+        minutes: int,
+    ) -> dict[str, Any]:
+        """Snooze one reminder type for a short delay.
+
+        Use this only when the user explicitly asks to snooze a reminder or delay it for a number of minutes. Do not use it for permanent cadence changes or quiet hours.
+        """
+
+        tool_name = "snooze_reminder"
+        self._log_tool_call_received(tool_name, reminder_type=reminder_type, minutes=minutes)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="snooze",
+            normalized_args={"reminder_type": reminder_type, "minutes": minutes},
+        )
+        try:
+            result = self._context_controller.snooze_reminder(reminder_type, minutes)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        runtime = result.get("runtime", {})
+        cooldown_key = {
+            "drink_water": "water_cooldown_until",
+            "nap": "nap_cooldown_until",
+            "check_in": "check_in_cooldown_until",
+        }[reminder_type]
+        self._log_tool_completed(
+            tool_name,
+            operation="snooze",
+            stored={
+                "reminder_type": reminder_type,
+                "snooze_minutes": minutes,
+                "cooldown_until": runtime.get(cooldown_key),
+            },
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def clear_reminder_snooze(
+        self,
+        context: RunContext,
+        reminder_type: Literal["drink_water", "nap", "check_in"],
+    ) -> dict[str, Any]:
+        """Clear the active snooze or cooldown for one reminder type.
+
+        Use this when the user asks to unsnooze a reminder or wants it active again immediately.
+        """
+
+        tool_name = "clear_reminder_snooze"
+        self._log_tool_call_received(tool_name, reminder_type=reminder_type)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="clear_snooze",
+            normalized_args={"reminder_type": reminder_type},
+        )
+        try:
+            result = self._context_controller.clear_reminder_snooze(reminder_type)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        runtime = result.get("runtime", {})
+        cooldown_key = {
+            "drink_water": "water_cooldown_until",
+            "nap": "nap_cooldown_until",
+            "check_in": "check_in_cooldown_until",
+        }[reminder_type]
+        self._log_tool_completed(
+            tool_name,
+            operation="clear_snooze",
+            stored={
+                "reminder_type": reminder_type,
+                "cooldown_until": runtime.get(cooldown_key),
+            },
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def reset_reminder_policy(
+        self,
+        context: RunContext,
+        reminder_type: Literal["drink_water", "nap", "check_in"],
+    ) -> dict[str, Any]:
+        """Reset one reminder policy back to its defaults.
+
+        Use this when the user wants one reminder type restored to the default schedule and default enabled state.
+        """
+
+        tool_name = "reset_reminder_policy"
+        self._log_tool_call_received(tool_name, reminder_type=reminder_type)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="reset_reminder_policy",
+            normalized_args={"reminder_type": reminder_type},
+        )
+        try:
+            result = self._context_controller.reset_reminder_policy(reminder_type)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        policy = result.get("policies", {}).get(reminder_type, {})
+        self._log_tool_completed(
+            tool_name,
+            operation="reset_reminder_policy",
+            stored={
+                "reminder_type": reminder_type,
+                "enabled": policy.get("enabled"),
+                "interval_minutes": policy.get("interval_minutes"),
+            },
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def set_quiet_hours(
+        self,
+        context: RunContext,
+        start: str,
+        end: str,
+    ) -> dict[str, Any]:
+        """Set the quiet-hours time range.
+
+        Use this only when the user explicitly gives a quiet-hours start and end time range. Do not use it for reminder cadence or snoozing.
+        """
+
+        tool_name = "set_quiet_hours"
+        self._log_tool_call_received(tool_name, start=start, end=end)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="set_quiet_hours",
+            normalized_args={"start": start, "end": end},
+        )
+        try:
+            result = self._context_controller.set_quiet_hours(start, end)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        profile = result.get("profile", {})
+        self._log_tool_completed(
+            tool_name,
+            operation="set_quiet_hours",
+            stored={
+                "quiet_hours_start": profile.get("quiet_hours_start"),
+                "quiet_hours_end": profile.get("quiet_hours_end"),
+            },
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def reset_quiet_hours(self, context: RunContext) -> dict[str, Any]:
+        """Reset quiet hours to the default range.
+
+        Use this when the user wants the standard quiet-hours schedule back.
+        """
+
+        tool_name = "reset_quiet_hours"
+        self._log_tool_call_received(tool_name)
+        try:
+            result = self._context_controller.reset_quiet_hours()
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        profile = result.get("profile", {})
+        self._log_tool_completed(
+            tool_name,
+            operation="reset_quiet_hours",
+            stored={
+                "quiet_hours_start": profile.get("quiet_hours_start"),
+                "quiet_hours_end": profile.get("quiet_hours_end"),
+            },
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def update_user_profile(
+        self,
+        context: RunContext,
+        preferred_name: str | None = None,
+        timezone: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or update persisted user profile fields.
+
+        Use this when the user explicitly gives or changes their preferred name or timezone.
+        """
+
+        tool_name = "update_user_profile"
+        self._log_tool_call_received(
+            tool_name,
+            preferred_name=preferred_name,
+            timezone=timezone,
+        )
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="update_user_profile",
+            normalized_args={"preferred_name": preferred_name, "timezone": timezone},
+        )
+        try:
+            result = self._context_controller.update_user_profile(
+                preferred_name=preferred_name,
+                timezone=timezone,
+            )
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        profile = result.get("profile", {})
+        self._log_tool_completed(
+            tool_name,
+            operation="update_user_profile",
+            stored={
+                "preferred_name": profile.get("preferred_name"),
+                "timezone": profile.get("timezone"),
+            },
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def clear_preferred_name(self, context: RunContext) -> dict[str, Any]:
+        """Clear the stored preferred name.
+
+        Use this when the user asks you to forget or remove the saved preferred name.
+        """
+
+        tool_name = "clear_preferred_name"
+        self._log_tool_call_received(tool_name)
+        result = self._context_controller.clear_preferred_name()
+        profile = result.get("profile", {})
+        self._log_tool_completed(
+            tool_name,
+            operation="clear_preferred_name",
+            stored={"preferred_name": profile.get("preferred_name")},
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def set_current_activity(
+        self,
+        context: RunContext,
+        activity: str,
+        duration_minutes: int | None = None,
+    ) -> dict[str, Any]:
+        """Set the user's current temporary activity state.
+
+        Use this when the user says they are busy, working, coding, resting, out, or napping and wants that to affect proactive behavior.
+        """
+
+        tool_name = "set_current_activity"
+        self._log_tool_call_received(
+            tool_name,
+            activity=activity,
+            duration_minutes=duration_minutes,
+        )
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="set_current_activity",
+            normalized_args={"activity": activity, "duration_minutes": duration_minutes},
+        )
+        try:
+            result = self._context_controller.set_current_activity(
+                activity,
+                duration_minutes=duration_minutes,
+            )
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        self._data_flow.write(
+            "status_tool_set_current_activity",
+            activity=activity,
+            duration_minutes=duration_minutes,
+            result=result,
+        )
+        runtime = result.get("runtime", {})
+        self._log_tool_completed(
+            tool_name,
+            operation="set_current_activity",
+            stored={
+                "current_activity": runtime.get("current_activity"),
+                "activity_expires_at": runtime.get("activity_expires_at"),
+                "busy_state": runtime.get("busy_state"),
+            },
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def clear_recent_summary(self, context: RunContext) -> dict[str, Any]:
+        """Clear the rolling recent conversation summary used by the status system.
+
+        Use this when the user asks to clear short-run status context or reset the recent-summary portion of proactive memory.
+        """
+
+        tool_name = "clear_recent_summary"
+        self._log_tool_call_received(tool_name)
+        result = self._context_controller.clear_recent_summary()
+        runtime = result.get("runtime", {})
+        self._log_tool_completed(
+            tool_name,
+            operation="clear_recent_summary",
+            stored={"recent_summary": runtime.get("recent_summary")},
+            result=result,
+        )
+        return result
+
+    @function_tool()
+    async def get_daily_status(self, context: RunContext, day: str = "today") -> dict[str, Any]:
+        """Get structured proactive reminder history for a specific day.
+
+        Use this when the user asks about today, yesterday, or a specific ISO date such as 2026-04-22.
+        """
+
+        tool_name = "get_daily_status"
+        self._log_tool_call_received(tool_name, day=day)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="get_daily_status",
+            normalized_args={"day": day},
+        )
+        try:
+            result = self._context_controller.daily_status(day)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        self._data_flow.write("status_tool_daily_status", day=day, result=result)
+        self._log_tool_completed(tool_name, operation="get_daily_status", result=result)
+        return result
+
+    @function_tool()
+    async def get_recent_status_history(
+        self, context: RunContext, days: int = 7
+    ) -> list[dict[str, Any]]:
+        """Get recent structured proactive history for the last few days.
+
+        Use this when the user asks for recent reminder history, habit tracking, or a multi-day status summary.
+        """
+
+        tool_name = "get_recent_status_history"
+        self._log_tool_call_received(tool_name, days=days)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="get_recent_status_history",
+            normalized_args={"days": days},
+        )
+        try:
+            result = self._context_controller.recent_status_history(days=days)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        self._data_flow.write("status_tool_recent_history", days=days, result=result)
+        self._log_tool_completed(tool_name, operation="get_recent_status_history", result=result)
+        return result
+
+    @function_tool()
+    async def delete_daily_status(self, context: RunContext, day: str = "today") -> dict[str, Any]:
+        """Delete one day's persisted proactive history row.
+
+        Use this when the user explicitly asks to remove the stored reminder history for today, yesterday, or a specific ISO date.
+        """
+
+        tool_name = "delete_daily_status"
+        self._log_tool_call_received(tool_name, day=day)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="delete_daily_status",
+            normalized_args={"day": day},
+        )
+        try:
+            result = self._context_controller.delete_daily_status(day)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        self._log_tool_completed(tool_name, operation="delete_daily_status", result=result)
+        return result
+
+    @function_tool()
+    async def clear_temporary_status(self, context: RunContext) -> dict[str, Any]:
+        """Clear temporary activity state such as busy, working, resting, or napping.
+
+        Use this when the user asks to clear or reset the current temporary status.
+        """
+
+        tool_name = "clear_temporary_status"
+        self._log_tool_call_received(tool_name)
+        result = self._context_controller.clear_temporary_status()
+        self._data_flow.write("status_tool_clear_temporary_status", result=result)
+        runtime = result.get("runtime", {})
+        self._log_tool_completed(
+            tool_name,
+            operation="clear_temporary_status",
+            stored={
+                "current_activity": runtime.get("current_activity"),
+                "busy_state": runtime.get("busy_state"),
+            },
+            result=result,
+        )
+        return result
+
+    @function_tool()
     async def search_memory(self, context: RunContext, query: str) -> list[dict[str, Any]]:
         """Search the agent's long-run memory.
 
@@ -1128,7 +1794,9 @@ class Assistant(Agent):
 
         logger.info("Memory search tool called", extra={"query_chars": len(query)})
         records = await self._context_controller.search(query)
-        return records_for_tool(records)
+        result = records_for_tool(records)
+        self._data_flow.write("memory_tool_search", query=query, result=result)
+        return result
 
     @function_tool()
     async def list_memories(
@@ -1144,7 +1812,9 @@ class Assistant(Agent):
 
         logger.info("Memory list tool called", extra={"limit": limit})
         records = self._context_controller.list_memories(limit=limit)
-        return records_for_tool(records)
+        result = records_for_tool(records)
+        self._data_flow.write("memory_tool_list", limit=limit, result=result)
+        return result
 
     @function_tool()
     async def forget_memory(self, context: RunContext, query: str) -> dict[str, Any]:
@@ -1159,8 +1829,12 @@ class Assistant(Agent):
         logger.warning("Memory forget tool called", extra={"query_chars": len(query)})
         record = await self._context_controller.forget_memory(query)
         if record is None:
-            return {"deleted": False, "message": "No matching memory was found."}
-        return {"deleted": True, "memory": records_for_tool([record])[0]}
+            result = {"deleted": False, "message": "No matching memory was found."}
+            self._data_flow.write("memory_tool_forget", query=query, result=result)
+            return result
+        result = {"deleted": True, "memory": records_for_tool([record])[0]}
+        self._data_flow.write("memory_tool_forget", query=query, result=result)
+        return result
 
     @function_tool()
     async def forget_all_memories(
@@ -1176,12 +1850,120 @@ class Assistant(Agent):
 
         logger.warning("Forget all memories tool called", extra={"confirm": confirm})
         if not confirm:
-            return {
+            result = {
                 "deleted": 0,
                 "message": "Confirmation is required before deleting all memories.",
             }
+            self._data_flow.write("memory_tool_forget_all", confirm=confirm, result=result)
+            return result
         deleted = self._context_controller.forget_all_memories()
-        return {"deleted": deleted}
+        result = {"deleted": deleted}
+        self._data_flow.write("memory_tool_forget_all", confirm=confirm, result=result)
+        return result
+
+
+class ProactiveScheduler:
+    def __init__(
+        self,
+        *,
+        session: AgentSession,
+        room: rtc.Room,
+        context_controller: Any,
+        status_display: StatusDisplay,
+        data_flow: DataFlowLogger | None = None,
+        tick_seconds: int | None = None,
+    ) -> None:
+        self._session = session
+        self._room = room
+        self._context_controller = context_controller
+        self._status_display = status_display
+        self._data_flow = data_flow or DataFlowLogger()
+        self._tick_seconds = tick_seconds or _env_int("PROACTIVE_TICK_SECONDS", 60)
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run(), name="proactive-scheduler")
+
+    async def stop(self) -> None:
+        task = self._task
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        self._task = None
+
+    async def _run(self) -> None:
+        logger.info("Proactive scheduler started", extra={"tick_seconds": self._tick_seconds})
+        try:
+            while True:
+                await asyncio.sleep(self._tick_seconds)
+                await self._tick()
+        except asyncio.CancelledError:
+            logger.info("Proactive scheduler stopped")
+            raise
+
+    async def _tick(self) -> None:
+        allowed, reason = self._can_proactively_speak()
+        logger.info("Proactive scheduler tick", extra={"allowed": allowed, "reason": reason})
+        self._data_flow.write("proactive_tick", allowed=allowed, reason=reason)
+        if not allowed:
+            return
+        action: ProactiveAction | None = self._context_controller.next_proactive_action()
+        if action is None:
+            self._data_flow.write("proactive_decision", decision="no_action")
+            return
+        logger.info(
+            "Proactive action selected",
+            extra={"reminder_type": action.reminder_type, "mode": action.mode},
+        )
+        self._data_flow.write(
+            "proactive_action",
+            reminder_type=action.reminder_type,
+            mode=action.mode,
+            text=action.text,
+            instructions=action.instructions,
+        )
+        with self._status_display.showing("proactive"):
+            if action.mode == "say" and action.text:
+                handle = self._session.say(
+                    action.text,
+                    allow_interruptions=True,
+                    add_to_chat_ctx=True,
+                )
+            else:
+                chat_ctx = self._session.current_agent.chat_ctx.copy()
+                controlled_ctx = await self._context_controller.prepare_llm_context(
+                    chat_ctx,
+                    latest_user_text=None,
+                )
+                handle = self._session.generate_reply(
+                    instructions=action.instructions,
+                    allow_interruptions=True,
+                    chat_ctx=controlled_ctx,
+                )
+            self._context_controller.record_proactive_outcome(action.reminder_type, "sent")
+            self._data_flow.write(
+                "proactive_execution",
+                reminder_type=action.reminder_type,
+                mode=action.mode,
+                text=action.text,
+                instructions=action.instructions,
+            )
+            await handle
+
+    def _can_proactively_speak(self) -> tuple[bool, str]:
+        if self._session.current_speech is not None:
+            return False, "current_speech"
+        if self._status_display.is_processing:
+            return False, "processing"
+        if not self._room.remote_participants:
+            return False, "no_remote_participants"
+        reason = self._context_controller.proactive_gate_reason()
+        if reason:
+            return False, reason
+        return True, "ok"
 
 
 server = AgentServer(num_idle_processes=1)
@@ -1253,13 +2035,16 @@ async def my_agent(ctx: JobContext):
     status_display = ctx.proc.userdata.get("status_display") or StatusDisplay()
     status_display.set_state("ready")
     context_controller = ContextController(status_reporter=status_display)
+    data_flow = DataFlowLogger()
+    assistant = Assistant(
+        context_controller=context_controller,
+        status_display=status_display,
+        data_flow=data_flow,
+    )
 
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
-        agent=Assistant(
-            context_controller=context_controller,
-            status_display=status_display,
-        ),
+        agent=assistant,
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=build_audio_input_options(),
@@ -1269,6 +2054,19 @@ async def my_agent(ctx: JobContext):
     # Join the room and connect to the user
     await ctx.connect()
     status_display.set_state("in_room")
+    scheduler = ProactiveScheduler(
+        session=session,
+        room=ctx.room,
+        context_controller=context_controller,
+        status_display=status_display,
+        data_flow=data_flow,
+    )
+    scheduler.start()
+
+    async def _shutdown_scheduler(_: str) -> None:
+        await scheduler.stop()
+
+    ctx.add_shutdown_callback(_shutdown_scheduler)
 
 
 if __name__ == "__main__":

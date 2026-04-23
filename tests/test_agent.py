@@ -4,6 +4,7 @@ from livekit.agents import AgentSession, ToolError, inference, llm, stt
 from agent import (
     Assistant,
     DataFlowLogger,
+    ProactiveScheduler,
     SenseHatReader,
     StatusDisplay,
     TranscriptCorrector,
@@ -146,11 +147,53 @@ def test_assistant_exposes_sensehat_tools() -> None:
         "get_sensehat_light",
         "get_sensehat_display",
         "get_sensehat_snapshot",
+        "get_status_summary",
+        "set_water_reminder_interval",
+        "set_check_in_interval",
+        "set_reminder_enabled",
+        "get_reminder_policy",
+        "snooze_reminder",
+        "clear_reminder_snooze",
+        "reset_reminder_policy",
+        "set_quiet_hours",
+        "reset_quiet_hours",
+        "update_user_profile",
+        "clear_preferred_name",
+        "set_current_activity",
+        "clear_recent_summary",
+        "get_daily_status",
+        "get_recent_status_history",
+        "delete_daily_status",
+        "clear_temporary_status",
         "search_memory",
         "list_memories",
         "forget_memory",
         "forget_all_memories",
     }.issubset(tool_ids)
+
+
+@pytest.mark.asyncio
+async def test_set_quiet_hours_reports_validation_errors_as_tool_errors() -> None:
+    class BrokenContextController:
+        def set_quiet_hours(self, start: str, end: str):
+            raise ValueError("start must be in HH:MM or am/pm format")
+
+    assistant = Assistant(context_controller=BrokenContextController())
+
+    with pytest.raises(ToolError, match="start must be in HH:MM or am/pm format"):
+        await assistant.set_quiet_hours(None, "not-a-time", "08:00")
+
+
+@pytest.mark.asyncio
+async def test_set_reminder_enabled_reports_invalid_types_as_tool_errors() -> None:
+    class BrokenContextController:
+        def set_reminder_enabled(self, reminder_type: str, enabled: bool):
+            raise ValueError("reminder_type must be one of drink_water, nap, or check_in")
+
+    assistant = Assistant(context_controller=BrokenContextController())
+
+    with pytest.raises(ToolError, match="reminder_type must be one of"):
+        await assistant.set_reminder_enabled(None, "coffee", True)
 
 
 def test_sensehat_errors_are_reported_as_tool_errors() -> None:
@@ -355,6 +398,167 @@ def test_session_llm_can_use_livekit_inference(monkeypatch) -> None:
     selected = build_session_llm()
 
     assert selected.provider == "livekit"
+
+
+class _FakeRoom:
+    def __init__(self, *, has_remote_participants: bool = True) -> None:
+        self.remote_participants = {"user-1": object()} if has_remote_participants else {}
+
+
+class _FakeHandle:
+    def __init__(self) -> None:
+        self.interrupted = False
+
+    def __await__(self):
+        async def _wait():
+            return None
+
+        return _wait().__await__()
+
+
+class _FakeAgentForScheduler:
+    def __init__(self) -> None:
+        self.chat_ctx = llm.ChatContext()
+        self.chat_ctx.add_message(role="user", content="hello")
+
+
+class _FakeSession:
+    def __init__(self) -> None:
+        self.current_speech = None
+        self.current_agent = _FakeAgentForScheduler()
+        self.say_calls: list[dict[str, object]] = []
+        self.generate_calls: list[dict[str, object]] = []
+
+    def say(self, text: str, **kwargs):
+        self.say_calls.append({"text": text, **kwargs})
+        return _FakeHandle()
+
+    def generate_reply(self, **kwargs):
+        self.generate_calls.append(kwargs)
+        return _FakeHandle()
+
+
+class _FakeContextController:
+    def __init__(self, action=None, gate_reason=None) -> None:
+        self.action = action
+        self.gate_reason = gate_reason
+        self.recorded: list[tuple[str, str]] = []
+
+    def next_proactive_action(self):
+        return self.action
+
+    def proactive_gate_reason(self):
+        return self.gate_reason
+
+    async def prepare_llm_context(self, chat_ctx, *, latest_user_text):
+        return chat_ctx
+
+    def record_proactive_outcome(self, reminder_type: str, outcome: str) -> None:
+        self.recorded.append((reminder_type, outcome))
+
+
+@pytest.mark.asyncio
+async def test_proactive_scheduler_skips_when_processing() -> None:
+    session = _FakeSession()
+    room = _FakeRoom()
+    controller = _FakeContextController()
+    display = StatusDisplay(enabled=False)
+    display.set_state("llm")
+    scheduler = ProactiveScheduler(
+        session=session,
+        room=room,
+        context_controller=controller,
+        status_display=display,
+    )
+
+    await scheduler._tick()
+
+    assert session.say_calls == []
+    assert session.generate_calls == []
+
+
+@pytest.mark.asyncio
+async def test_proactive_scheduler_skips_during_post_user_grace() -> None:
+    session = _FakeSession()
+    room = _FakeRoom()
+    controller = _FakeContextController(gate_reason="post_user_grace")
+    display = StatusDisplay(enabled=False)
+    display.set_state("in_room")
+    scheduler = ProactiveScheduler(
+        session=session,
+        room=room,
+        context_controller=controller,
+        status_display=display,
+    )
+
+    await scheduler._tick()
+
+    assert session.say_calls == []
+    assert session.generate_calls == []
+
+
+@pytest.mark.asyncio
+async def test_proactive_scheduler_skips_during_post_assistant_grace() -> None:
+    session = _FakeSession()
+    room = _FakeRoom()
+    controller = _FakeContextController(gate_reason="post_assistant_grace")
+    display = StatusDisplay(enabled=False)
+    display.set_state("in_room")
+    scheduler = ProactiveScheduler(
+        session=session,
+        room=room,
+        context_controller=controller,
+        status_display=display,
+    )
+
+    await scheduler._tick()
+
+    assert session.say_calls == []
+    assert session.generate_calls == []
+
+
+@pytest.mark.asyncio
+async def test_proactive_scheduler_uses_say_for_fixed_reminders() -> None:
+    session = _FakeSession()
+    room = _FakeRoom()
+    controller = _FakeContextController(
+        action=type("Action", (), {"reminder_type": "drink_water", "mode": "say", "text": "Drink water.", "instructions": None})()
+    )
+    display = StatusDisplay(enabled=False)
+    display.set_state("in_room")
+    scheduler = ProactiveScheduler(
+        session=session,
+        room=room,
+        context_controller=controller,
+        status_display=display,
+    )
+
+    await scheduler._tick()
+
+    assert session.say_calls[0]["text"] == "Drink water."
+    assert controller.recorded == [("drink_water", "sent")]
+
+
+@pytest.mark.asyncio
+async def test_proactive_scheduler_uses_generate_reply_for_check_in() -> None:
+    session = _FakeSession()
+    room = _FakeRoom()
+    controller = _FakeContextController(
+        action=type("Action", (), {"reminder_type": "check_in", "mode": "generate_reply", "text": None, "instructions": "check in"})()
+    )
+    display = StatusDisplay(enabled=False)
+    display.set_state("in_room")
+    scheduler = ProactiveScheduler(
+        session=session,
+        room=room,
+        context_controller=controller,
+        status_display=display,
+    )
+
+    await scheduler._tick()
+
+    assert session.generate_calls[0]["instructions"] == "check in"
+    assert controller.recorded == [("check_in", "sent")]
 
 
 @pytest.mark.asyncio

@@ -154,6 +154,12 @@ Once you've started your own project based on this repo, you should:
 
 This project is production-ready and includes a working `Dockerfile`. To deploy it to LiveKit Cloud or another environment, see the [deploying to production](https://docs.livekit.io/deploy/agents/) guide.
 
+For Raspberry Pi 4 + Sense HAT deployment, including the `sense_hat` virtualenv fix and a `systemd` service setup, use [docs/raspberry-pi-deployment.md](docs/raspberry-pi-deployment.md).
+
+For the structured status, reminder, proactive scheduler, and human test checklist, use [docs/status-proactive-system.md](docs/status-proactive-system.md).
+
+For a general end-user guide covering everyday voice commands, reminders, memory, Sense HAT questions, and troubleshooting, use [docs/user-manual.md](docs/user-manual.md).
+
 ## Self-hosted LiveKit
 
 You can also self-host LiveKit instead of using LiveKit Cloud. See the [self-hosting](https://docs.livekit.io/transport/self-hosting/local/) guide for more information. If you choose to self-host, you'll need to also use [model plugins](https://docs.livekit.io/agents/models/#plugins) instead of LiveKit Inference and will need to remove the [LiveKit Cloud noise cancellation](https://docs.livekit.io/transport/media/noise-cancellation/) plugin.
