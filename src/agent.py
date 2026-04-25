@@ -47,6 +47,12 @@ from memory import (
     latest_user_message,
     records_for_tool,
 )
+from posture_integration import (
+    PostureControlClient,
+    PostureControlError,
+    PostureEventReceiver,
+    PostureIntakeServer,
+)
 
 logger = logging.getLogger("agent")
 data_flow_logger = logging.getLogger("agent.data_flow")
@@ -248,6 +254,36 @@ def _optional_float_env(name: str) -> float | None:
     except ValueError:
         logger.warning("Invalid float env var; ignoring", extra={"env": name, "value": value})
         return None
+
+
+def configured_posture_service_url() -> str:
+    return os.getenv("POSTURE_SERVICE_URL", "http://127.0.0.1:8766").strip()
+
+
+def configured_posture_shared_secret() -> str:
+    value = os.getenv("POSTURE_SHARED_SECRET", "").strip()
+    if value:
+        return value
+    return "local-posture-shared-secret"
+
+
+def configured_posture_default_duration_seconds() -> int:
+    return _env_int("POSTURE_DEFAULT_DURATION_SECONDS", 8 * 60 * 60)
+
+
+def build_posture_control_client() -> PostureControlClient:
+    return PostureControlClient(
+        base_url=configured_posture_service_url(),
+        timeout_seconds=float(os.getenv("POSTURE_SERVICE_TIMEOUT_SECONDS", "5.0")),
+    )
+
+
+def configured_posture_intake_host() -> str:
+    return os.getenv("POSTURE_AGENT_INTAKE_HOST", "127.0.0.1").strip()
+
+
+def configured_posture_intake_port() -> int:
+    return _env_int("POSTURE_AGENT_INTAKE_PORT", 8787)
 
 
 def build_session_tts() -> Any:
@@ -892,12 +928,18 @@ class Assistant(Agent):
         status_display: StatusDisplay | None = None,
         transcript_corrector: TranscriptCorrector | None = None,
         data_flow: DataFlowLogger | None = None,
+        posture_control_client: PostureControlClient | None = None,
+        posture_callback_url: str | None = None,
+        posture_shared_secret: str | None = None,
     ) -> None:
         self._sense_hat_reader = sense_hat_reader or SenseHatReader()
         self._context_controller = context_controller or DisabledContextController()
         self._status_display = status_display or StatusDisplay(enabled=False)
         self._transcript_corrector = transcript_corrector or TranscriptCorrector()
         self._data_flow = data_flow or DataFlowLogger()
+        self._posture_control_client = posture_control_client or build_posture_control_client()
+        self._posture_callback_url = posture_callback_url or "http://127.0.0.1:8787/internal/posture/events"
+        self._posture_shared_secret = posture_shared_secret or configured_posture_shared_secret()
         super().__init__(
             instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice, even if you perceive the conversation as text.
             You eagerly assist users with their questions by providing information from your extensive knowledge.
@@ -905,10 +947,13 @@ class Assistant(Agent):
             Do not answer questions about current sensor values from memory or general knowledge. Current Sense HAT readings require a Sense HAT tool call.
             When the user asks you to remember something, or asks what you remember, use the memory tools and answer plainly.
             When the user wants to inspect or configure proactive reminders, quiet hours, current activity, or recent reminder history, use the structured status tools.
+            When the user asks for posture help while working, use the posture monitoring tools.
             Use set_water_reminder_interval when the user changes only the water reminder cadence.
             Use set_check_in_interval when the user changes only the proactive check in cadence.
+            Use set_posture_coaching_interval when the user changes only how often posture coaching reminders should happen.
             Use update_user_profile when the user explicitly gives their preferred name or timezone.
             Use get_reminder_policy when the user asks about one reminder type specifically.
+            Use start_posture_monitoring to begin posture coaching immediately, stop_posture_monitoring to stop it, and get_posture_monitoring_status to inspect it.
             Do not snooze reminders unless the user explicitly says later, snooze, or asks for a delay.
             Do not change quiet hours unless the user explicitly mentions a time range.
             Sensor tool values are live readings from the device. State the units clearly and keep the answer short enough for voice.
@@ -1103,6 +1148,12 @@ class Assistant(Agent):
                 return result
         except Exception as exc:
             logger.exception("Unable to read Sense HAT %s data", category)
+            self._data_flow.write(
+                "sensehat_tool_error",
+                category=category,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+            )
             raise ToolError(
                 "I could not read the Sense HAT right now. Check that the Sense HAT is attached, enabled, and that the `sense_hat` Python package is available to this process."
             ) from exc
@@ -1174,6 +1225,193 @@ class Assistant(Agent):
         result = self._context_controller.status_summary()
         self._data_flow.write("status_tool_summary", result=result)
         self._log_tool_completed(tool_name, operation="status_summary", result=result)
+        return result
+
+    @function_tool()
+    async def start_posture_monitoring(self, context: RunContext) -> dict[str, Any]:
+        """Start posture monitoring immediately.
+
+        Use this when the user asks for help checking posture while working. This starts a posture-monitoring session and enables posture coaching reminders.
+        """
+
+        tool_name = "start_posture_monitoring"
+        self._log_tool_call_received(tool_name)
+        self._data_flow.write(
+            "posture_control_request",
+            action="start",
+            callback_url=self._posture_callback_url,
+        )
+        try:
+            result = self._posture_control_client.start_session(
+                callback_url=self._posture_callback_url,
+                callback_auth=self._posture_shared_secret,
+                duration_sec=configured_posture_default_duration_seconds(),
+                preview_enabled=True,
+            )
+            session_id = str(result.get("session_id", "")).strip()
+            summary = self._context_controller.start_posture_monitoring(
+                session_id,
+                preview_enabled=bool(result.get("preview_enabled", True)),
+                preview_active=bool(result.get("preview_active", False)),
+            )
+        except (PostureControlError, ValueError) as exc:
+            self._data_flow.write(
+                "posture_control_result",
+                action="start",
+                ok=False,
+                error=str(exc),
+            )
+            raise self._tool_error(tool_name, exc) from exc
+        self._data_flow.write(
+            "posture_control_result",
+            action="start",
+            ok=True,
+            result=result,
+        )
+        self._log_tool_completed(
+            tool_name,
+            operation="start_posture_monitoring",
+            stored={
+                "posture_session_id": summary.get("runtime", {}).get("posture_session_id"),
+                "posture_monitoring_active": summary.get("runtime", {}).get("posture_monitoring_active"),
+            },
+            result=summary,
+        )
+        return summary
+
+    @function_tool()
+    async def stop_posture_monitoring(self, context: RunContext) -> dict[str, Any]:
+        """Stop the active posture-monitoring session.
+
+        Use this when the user asks to stop posture help or stop posture reminders.
+        """
+
+        tool_name = "stop_posture_monitoring"
+        self._log_tool_call_received(tool_name)
+        session_id = self._context_controller.posture_monitoring_status().get("session_id")
+        self._data_flow.write("posture_control_request", action="stop", session_id=session_id)
+        try:
+            result = self._posture_control_client.stop_session(session_id=session_id)
+            summary = self._context_controller.stop_posture_monitoring()
+        except (PostureControlError, ValueError) as exc:
+            self._data_flow.write(
+                "posture_control_result",
+                action="stop",
+                ok=False,
+                error=str(exc),
+            )
+            raise self._tool_error(tool_name, exc) from exc
+        self._data_flow.write(
+            "posture_control_result",
+            action="stop",
+            ok=True,
+            result=result,
+        )
+        self._log_tool_completed(
+            tool_name,
+            operation="stop_posture_monitoring",
+            stored={
+                "posture_session_id": summary.get("runtime", {}).get("posture_session_id"),
+                "posture_monitoring_active": summary.get("runtime", {}).get("posture_monitoring_active"),
+            },
+            result=summary,
+        )
+        return summary
+
+    @function_tool()
+    async def get_posture_monitoring_status(self, context: RunContext) -> dict[str, Any]:
+        """Read the current posture-monitoring state.
+
+        Use this when the user asks whether posture monitoring is active or wants the latest posture status.
+        """
+
+        tool_name = "get_posture_monitoring_status"
+        self._log_tool_call_received(tool_name)
+        result = dict(self._context_controller.posture_monitoring_status())
+        service_status: dict[str, Any] | None = None
+        service_error: str | None = None
+        try:
+            service_status = self._posture_control_client.current_session()
+        except PostureControlError as exc:
+            service_error = str(exc)
+            logger.warning(
+                "Posture status service lookup failed",
+                extra={"error_type": type(exc).__name__, "error": service_error},
+            )
+        if service_status:
+            result["service"] = {
+                "ok": bool(service_status.get("ok", True)),
+                "state": service_status.get("state"),
+                "resource_state": service_status.get("resource_state"),
+                "monitoring_active": service_status.get("monitoring_active"),
+                "preview_enabled": service_status.get("preview_enabled"),
+                "preview_requested": service_status.get("preview_requested"),
+                "preview_active": service_status.get("preview_active"),
+                "preview_available": service_status.get("preview_available"),
+                "preview_process_running": service_status.get("preview_process_running"),
+                "preview_last_heartbeat_at": service_status.get("preview_last_heartbeat_at"),
+                "camera_adapter": service_status.get("camera_adapter"),
+                "camera_backend": service_status.get("camera_backend"),
+                "stream_name": service_status.get("stream_name"),
+                "frames_read_count": service_status.get("frames_read_count"),
+                "last_frame_at": service_status.get("last_frame_at"),
+                "last_analyzed_at": service_status.get("last_analyzed_at"),
+                "last_emitted_posture_event": service_status.get("last_emitted_posture_event"),
+                "session_created": service_status.get("session_created"),
+                "camera_opened": service_status.get("camera_opened"),
+                "first_frame_received": service_status.get("first_frame_received"),
+                "first_frame_analyzed": service_status.get("first_frame_analyzed"),
+                "first_posture_event_emitted": service_status.get("first_posture_event_emitted"),
+                "callback_target_healthy": service_status.get("callback_target_healthy"),
+                "callback_target_last_checked_at": service_status.get("callback_target_last_checked_at"),
+                "last_callback_attempt_at": service_status.get("last_callback_attempt_at"),
+                "last_callback_success_at": service_status.get("last_callback_success_at"),
+                "last_callback_error": service_status.get("last_callback_error"),
+                "posture_sample_interval_seconds": service_status.get(
+                    "posture_sample_interval_seconds"
+                ),
+                "posture_warning_cooldown_seconds": service_status.get(
+                    "posture_warning_cooldown_seconds"
+                ),
+                "last_error": service_status.get("last_error"),
+            }
+        if service_error:
+            result["service_error"] = service_error
+        self._log_tool_completed(tool_name, operation="get_posture_monitoring_status", result=result)
+        return result
+
+    @function_tool()
+    async def set_posture_coaching_interval(
+        self,
+        context: RunContext,
+        interval_minutes: int,
+    ) -> dict[str, Any]:
+        """Set how often spoken posture coaching reminders may repeat.
+
+        Use this only when the user changes the spoken posture coaching cadence. This does not change camera sampling or detector callback frequency.
+        """
+
+        tool_name = "set_posture_coaching_interval"
+        self._log_tool_call_received(tool_name, interval_minutes=interval_minutes)
+        self._log_tool_arguments_normalized(
+            tool_name,
+            operation="set_posture_coaching_interval",
+            normalized_args={"interval_minutes": interval_minutes},
+        )
+        try:
+            result = self._context_controller.set_posture_coaching_interval(interval_minutes)
+        except ValueError as exc:
+            raise self._tool_error(tool_name, exc) from exc
+        runtime = result.get("runtime", {})
+        self._log_tool_completed(
+            tool_name,
+            operation="set_posture_coaching_interval",
+            stored={
+                "posture_reminder_cooldown_seconds": runtime.get("posture_reminder_cooldown_seconds"),
+                "posture_session_id": runtime.get("posture_session_id"),
+            },
+            result=result,
+        )
         return result
 
     def _log_tool_call_received(self, tool_name: str, **raw_args: Any) -> None:
@@ -1943,7 +2181,10 @@ class ProactiveScheduler:
                     allow_interruptions=True,
                     chat_ctx=controlled_ctx,
                 )
-            self._context_controller.record_proactive_outcome(action.reminder_type, "sent")
+            if action.reminder_type.startswith("posture:"):
+                self._context_controller.record_posture_reminder_sent(action.reminder_type)
+            else:
+                self._context_controller.record_proactive_outcome(action.reminder_type, "sent")
             self._data_flow.write(
                 "proactive_execution",
                 reminder_type=action.reminder_type,
@@ -2036,10 +2277,24 @@ async def my_agent(ctx: JobContext):
     status_display.set_state("ready")
     context_controller = ContextController(status_reporter=status_display)
     data_flow = DataFlowLogger()
+    posture_receiver = PostureEventReceiver(
+        expected_auth=configured_posture_shared_secret(),
+        context_controller=context_controller,
+        data_flow=data_flow,
+    )
+    posture_intake_server = PostureIntakeServer(
+        host=configured_posture_intake_host(),
+        port=configured_posture_intake_port(),
+        receiver=posture_receiver,
+    )
+    posture_intake_server.start()
     assistant = Assistant(
         context_controller=context_controller,
         status_display=status_display,
         data_flow=data_flow,
+        posture_control_client=build_posture_control_client(),
+        posture_callback_url=posture_intake_server.callback_url(),
+        posture_shared_secret=configured_posture_shared_secret(),
     )
 
     # Start the session, which initializes the voice pipeline and warms up the models
@@ -2067,6 +2322,11 @@ async def my_agent(ctx: JobContext):
         await scheduler.stop()
 
     ctx.add_shutdown_callback(_shutdown_scheduler)
+
+    async def _shutdown_posture_server(_: str) -> None:
+        posture_intake_server.stop()
+
+    ctx.add_shutdown_callback(_shutdown_posture_server)
 
 
 if __name__ == "__main__":

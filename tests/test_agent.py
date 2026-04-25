@@ -148,6 +148,10 @@ def test_assistant_exposes_sensehat_tools() -> None:
         "get_sensehat_display",
         "get_sensehat_snapshot",
         "get_status_summary",
+        "start_posture_monitoring",
+        "stop_posture_monitoring",
+        "get_posture_monitoring_status",
+        "set_posture_coaching_interval",
         "set_water_reminder_interval",
         "set_check_in_interval",
         "set_reminder_enabled",
@@ -196,6 +200,185 @@ async def test_set_reminder_enabled_reports_invalid_types_as_tool_errors() -> No
         await assistant.set_reminder_enabled(None, "coffee", True)
 
 
+@pytest.mark.asyncio
+async def test_start_posture_monitoring_calls_posture_service_and_updates_context() -> None:
+    class FakePostureClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def start_session(
+            self,
+            *,
+            callback_url: str,
+            callback_auth: str,
+            duration_sec: int,
+            preview_enabled: bool = False,
+        ) -> dict[str, object]:
+            self.calls.append(
+                {
+                    "callback_url": callback_url,
+                    "callback_auth": callback_auth,
+                    "duration_sec": duration_sec,
+                    "preview_enabled": preview_enabled,
+                }
+            )
+            return {"session_id": "posture-123"}
+
+    class FakeContextController:
+        def __init__(self) -> None:
+            self.started: list[dict[str, object]] = []
+
+        def start_posture_monitoring(
+            self,
+            session_id: str,
+            *,
+            preview_enabled: bool = False,
+            preview_active: bool = False,
+        ) -> dict[str, object]:
+            self.started.append(
+                {
+                    "session_id": session_id,
+                    "preview_enabled": preview_enabled,
+                    "preview_active": preview_active,
+                }
+            )
+            return {
+                "runtime": {
+                    "posture_session_id": session_id,
+                    "posture_monitoring_active": True,
+                    "posture_preview_enabled": preview_enabled,
+                    "posture_preview_active": preview_active,
+                }
+            }
+
+    client = FakePostureClient()
+    controller = FakeContextController()
+    assistant = Assistant(
+        posture_control_client=client,
+        posture_callback_url="http://127.0.0.1:8787/internal/posture/events",
+        posture_shared_secret="secret-token",
+        context_controller=controller,
+    )
+
+    result = await assistant.start_posture_monitoring(None)
+
+    assert client.calls == [
+        {
+            "callback_url": "http://127.0.0.1:8787/internal/posture/events",
+            "callback_auth": "secret-token",
+            "duration_sec": 28800,
+            "preview_enabled": True,
+        }
+    ]
+    assert controller.started == [
+        {
+            "session_id": "posture-123",
+            "preview_enabled": True,
+            "preview_active": False,
+        }
+    ]
+    assert result["runtime"]["posture_session_id"] == "posture-123"
+
+
+@pytest.mark.asyncio
+async def test_stop_posture_monitoring_calls_posture_service_and_updates_context() -> None:
+    class FakePostureClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def stop_session(self, *, session_id: str | None = None) -> dict[str, object]:
+            self.calls.append({"session_id": session_id})
+            return {"ok": True, "session_id": session_id}
+
+    class FakeContextController:
+        def posture_monitoring_status(self) -> dict[str, object]:
+            return {"session_id": "posture-123"}
+
+        def stop_posture_monitoring(self) -> dict[str, object]:
+            return {
+                "runtime": {
+                    "posture_session_id": None,
+                    "posture_monitoring_active": False,
+                }
+            }
+
+    client = FakePostureClient()
+    assistant = Assistant(
+        posture_control_client=client,
+        context_controller=FakeContextController(),
+    )
+
+    result = await assistant.stop_posture_monitoring(None)
+
+    assert client.calls == [{"session_id": "posture-123"}]
+    assert result["runtime"]["posture_monitoring_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_posture_monitoring_status_includes_service_runtime_details() -> None:
+    class FakePostureClient:
+        def current_session(self) -> dict[str, object]:
+            return {
+                "ok": True,
+                "state": "running",
+                "resource_state": "ready",
+                "monitoring_active": True,
+                "preview_enabled": True,
+                "preview_requested": True,
+                "preview_active": True,
+                "preview_available": True,
+                "preview_process_running": True,
+                "preview_last_heartbeat_at": 123.45,
+                "camera_adapter": "RealCameraAdapter",
+                "camera_backend": "auto",
+                "stream_name": "libcamera-0",
+                "frames_read_count": 42,
+                "last_frame_at": 123.4,
+                "last_analyzed_at": 123.5,
+                "last_emitted_posture_event": "posture.warning",
+                "session_created": True,
+                "camera_opened": True,
+                "first_frame_received": True,
+                "first_frame_analyzed": True,
+                "first_posture_event_emitted": True,
+                "callback_target_healthy": True,
+                "callback_target_last_checked_at": 123.2,
+                "last_callback_attempt_at": 123.6,
+                "last_callback_success_at": 123.7,
+                "last_callback_error": None,
+                "posture_sample_interval_seconds": 0.2,
+                "posture_warning_cooldown_seconds": 8.0,
+                "last_error": None,
+            }
+
+    class FakeContextController:
+        def posture_monitoring_status(self) -> dict[str, object]:
+            return {
+                "active": True,
+                "session_id": "posture-123",
+                "preview_enabled": True,
+                "preview_active": False,
+                "last_callback_at": None,
+                "last_callback_event": None,
+                "coaching_interval_seconds": 60.0,
+                "coaching_interval_minutes": 1.0,
+            }
+
+    assistant = Assistant(
+        posture_control_client=FakePostureClient(),
+        context_controller=FakeContextController(),
+    )
+
+    result = await assistant.get_posture_monitoring_status(None)
+
+    assert result["active"] is True
+    assert result["service"]["camera_adapter"] == "RealCameraAdapter"
+    assert result["service"]["frames_read_count"] == 42
+    assert result["service"]["last_emitted_posture_event"] == "posture.warning"
+    assert result["service"]["preview_process_running"] is True
+    assert result["service"]["callback_target_healthy"] is True
+
+
 def test_sensehat_errors_are_reported_as_tool_errors() -> None:
     class BrokenReader:
         def environment(self):
@@ -205,6 +388,27 @@ def test_sensehat_errors_are_reported_as_tool_errors() -> None:
 
     with pytest.raises(ToolError):
         assistant._read_sense_hat("environment")
+
+
+def test_sensehat_errors_are_logged_to_data_flow(tmp_path) -> None:
+    log_path = tmp_path / "data_flow.jsonl"
+
+    class BrokenReader:
+        def environment(self):
+            raise RuntimeError("missing hardware")
+
+    assistant = Assistant(
+        sense_hat_reader=BrokenReader(),
+        data_flow=DataFlowLogger(path=log_path),
+    )
+
+    with pytest.raises(ToolError):
+        assistant._read_sense_hat("environment")
+
+    content = log_path.read_text(encoding="utf-8")
+    assert '"event": "sensehat_tool_error"' in content
+    assert '"category": "environment"' in content
+    assert '"error_type": "RuntimeError"' in content
 
 
 def test_status_display_writes_led_pattern() -> None:
@@ -443,6 +647,7 @@ class _FakeContextController:
         self.action = action
         self.gate_reason = gate_reason
         self.recorded: list[tuple[str, str]] = []
+        self.posture_recorded: list[str] = []
 
     def next_proactive_action(self):
         return self.action
@@ -455,6 +660,9 @@ class _FakeContextController:
 
     def record_proactive_outcome(self, reminder_type: str, outcome: str) -> None:
         self.recorded.append((reminder_type, outcome))
+
+    def record_posture_reminder_sent(self, reminder_type: str, *, now=None) -> None:
+        self.posture_recorded.append(reminder_type)
 
 
 @pytest.mark.asyncio
@@ -559,6 +767,38 @@ async def test_proactive_scheduler_uses_generate_reply_for_check_in() -> None:
 
     assert session.generate_calls[0]["instructions"] == "check in"
     assert controller.recorded == [("check_in", "sent")]
+
+
+@pytest.mark.asyncio
+async def test_proactive_scheduler_records_posture_reminders_separately() -> None:
+    session = _FakeSession()
+    room = _FakeRoom()
+    controller = _FakeContextController(
+        action=type(
+            "Action",
+            (),
+            {
+                "reminder_type": "posture:neck_alignment",
+                "mode": "say",
+                "text": "Bring your head back a little and straighten your neck.",
+                "instructions": None,
+            },
+        )()
+    )
+    display = StatusDisplay(enabled=False)
+    display.set_state("in_room")
+    scheduler = ProactiveScheduler(
+        session=session,
+        room=room,
+        context_controller=controller,
+        status_display=display,
+    )
+
+    await scheduler._tick()
+
+    assert session.say_calls[0]["text"].startswith("Bring your head back")
+    assert controller.recorded == []
+    assert controller.posture_recorded == ["posture:neck_alignment"]
 
 
 @pytest.mark.asyncio

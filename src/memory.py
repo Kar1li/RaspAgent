@@ -100,6 +100,21 @@ class RuntimeStatus:
     water_cooldown_until: float | None = None
     check_in_cooldown_until: float | None = None
     nap_cooldown_until: float | None = None
+    posture_monitoring_active: bool = False
+    posture_workflow_active: bool = False
+    posture_session_id: str | None = None
+    latest_posture_label: str | None = None
+    latest_posture_severity: str | None = None
+    latest_posture_reason_codes: list[str] = field(default_factory=list)
+    latest_posture_metrics: dict[str, float] = field(default_factory=dict)
+    latest_posture_prompt_key: str | None = None
+    last_posture_event_at: float | None = None
+    posture_issue_cooldowns: dict[str, float] = field(default_factory=dict)
+    posture_preview_enabled: bool = False
+    posture_preview_active: bool = False
+    last_posture_callback_at: float | None = None
+    last_posture_callback_event: str | None = None
+    posture_reminder_cooldown_seconds: float = 60.0
     updated_at: float = 0.0
 
     @property
@@ -407,6 +422,58 @@ def _normalize_optional_name(value: Any, *, field_name: str) -> str | None:
     if len(candidate) > 80:
         raise ValueError(f"{field_name} must be 80 characters or fewer")
     return candidate
+
+
+def _load_json_list(value: Any) -> list[str]:
+    try:
+        loaded = json.loads(value or "[]")
+    except Exception:
+        return []
+    if not isinstance(loaded, list):
+        return []
+    return [str(item) for item in loaded if str(item).strip()]
+
+
+def _load_json_float_dict(value: Any) -> dict[str, float]:
+    try:
+        loaded = json.loads(value or "{}")
+    except Exception:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    result: dict[str, float] = {}
+    for key, item in loaded.items():
+        try:
+            result[str(key)] = float(item)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _normalize_posture_issue_key(
+    *,
+    reason_codes: list[str],
+    prompt_key: str | None,
+    posture_label: str | None,
+) -> str:
+    normalized_codes = {str(code).strip().replace("_", " ").lower() for code in reason_codes}
+    if "forward head" in normalized_codes or "neck" in normalized_codes:
+        return "neck_alignment"
+    if "rounded back" in normalized_codes or "trunk lean" in normalized_codes or "back" in normalized_codes:
+        return "back_alignment"
+    if (prompt_key or "").strip() == "remind_adjust_camera" or posture_label == "insufficient_data":
+        return "camera_adjustment"
+    return "general_posture"
+
+
+def _posture_guidance_text(issue_key: str) -> str:
+    mapping = {
+        "neck_alignment": "Bring your head back a little and straighten your neck.",
+        "back_alignment": "Sit taller and straighten your back.",
+        "camera_adjustment": "I cannot read your posture clearly. Please adjust the camera angle or lighting.",
+        "general_posture": "Please sit properly and adjust your posture.",
+    }
+    return mapping.get(issue_key, mapping["general_posture"])
 
 
 def _json_safe(value: Any) -> Any:
@@ -727,6 +794,21 @@ class SQLiteVectorMemoryStore:
                 water_cooldown_until REAL,
                 check_in_cooldown_until REAL,
                 nap_cooldown_until REAL,
+                posture_monitoring_active INTEGER NOT NULL DEFAULT 0,
+                posture_workflow_active INTEGER NOT NULL DEFAULT 0,
+                posture_session_id TEXT,
+                latest_posture_label TEXT,
+                latest_posture_severity TEXT,
+                latest_posture_reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                latest_posture_metrics_json TEXT NOT NULL DEFAULT '{}',
+                latest_posture_prompt_key TEXT,
+                last_posture_event_at REAL,
+                posture_issue_cooldowns_json TEXT NOT NULL DEFAULT '{}',
+                posture_preview_enabled INTEGER NOT NULL DEFAULT 0,
+                posture_preview_active INTEGER NOT NULL DEFAULT 0,
+                last_posture_callback_at REAL,
+                last_posture_callback_event TEXT,
+                posture_reminder_cooldown_seconds REAL NOT NULL DEFAULT 60.0,
                 updated_at REAL NOT NULL
             );
 
@@ -769,6 +851,81 @@ class SQLiteVectorMemoryStore:
             "agent_status",
             "last_assistant_speech_at",
             "last_assistant_speech_at REAL",
+        )
+        self._ensure_column(
+            "agent_status",
+            "posture_monitoring_active",
+            "posture_monitoring_active INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            "agent_status",
+            "posture_workflow_active",
+            "posture_workflow_active INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            "agent_status",
+            "posture_session_id",
+            "posture_session_id TEXT",
+        )
+        self._ensure_column(
+            "agent_status",
+            "latest_posture_label",
+            "latest_posture_label TEXT",
+        )
+        self._ensure_column(
+            "agent_status",
+            "latest_posture_severity",
+            "latest_posture_severity TEXT",
+        )
+        self._ensure_column(
+            "agent_status",
+            "latest_posture_reason_codes_json",
+            "latest_posture_reason_codes_json TEXT NOT NULL DEFAULT '[]'",
+        )
+        self._ensure_column(
+            "agent_status",
+            "latest_posture_metrics_json",
+            "latest_posture_metrics_json TEXT NOT NULL DEFAULT '{}'",
+        )
+        self._ensure_column(
+            "agent_status",
+            "latest_posture_prompt_key",
+            "latest_posture_prompt_key TEXT",
+        )
+        self._ensure_column(
+            "agent_status",
+            "last_posture_event_at",
+            "last_posture_event_at REAL",
+        )
+        self._ensure_column(
+            "agent_status",
+            "posture_issue_cooldowns_json",
+            "posture_issue_cooldowns_json TEXT NOT NULL DEFAULT '{}'",
+        )
+        self._ensure_column(
+            "agent_status",
+            "posture_preview_enabled",
+            "posture_preview_enabled INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            "agent_status",
+            "posture_preview_active",
+            "posture_preview_active INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            "agent_status",
+            "last_posture_callback_at",
+            "last_posture_callback_at REAL",
+        )
+        self._ensure_column(
+            "agent_status",
+            "last_posture_callback_event",
+            "last_posture_callback_event TEXT",
+        )
+        self._ensure_column(
+            "agent_status",
+            "posture_reminder_cooldown_seconds",
+            "posture_reminder_cooldown_seconds REAL NOT NULL DEFAULT 60.0",
         )
         self._conn.commit()
         logger.info("Memory database initialized", extra={"db_path": str(self._db_path)})
@@ -1162,6 +1319,23 @@ class SQLiteVectorMemoryStore:
             water_cooldown_until=row["water_cooldown_until"],
             check_in_cooldown_until=row["check_in_cooldown_until"],
             nap_cooldown_until=row["nap_cooldown_until"],
+            posture_monitoring_active=bool(row["posture_monitoring_active"]),
+            posture_workflow_active=bool(row["posture_workflow_active"]),
+            posture_session_id=row["posture_session_id"],
+            latest_posture_label=row["latest_posture_label"],
+            latest_posture_severity=row["latest_posture_severity"],
+            latest_posture_reason_codes=_load_json_list(row["latest_posture_reason_codes_json"]),
+            latest_posture_metrics=_load_json_float_dict(row["latest_posture_metrics_json"]),
+            latest_posture_prompt_key=row["latest_posture_prompt_key"],
+            last_posture_event_at=row["last_posture_event_at"],
+            posture_issue_cooldowns=_load_json_float_dict(row["posture_issue_cooldowns_json"]),
+            posture_preview_enabled=bool(row["posture_preview_enabled"]),
+            posture_preview_active=bool(row["posture_preview_active"]),
+            last_posture_callback_at=row["last_posture_callback_at"],
+            last_posture_callback_event=row["last_posture_callback_event"],
+            posture_reminder_cooldown_seconds=float(
+                row["posture_reminder_cooldown_seconds"] or 60.0
+            ),
             updated_at=float(row["updated_at"]),
         )
 
@@ -1173,7 +1347,12 @@ class SQLiteVectorMemoryStore:
             SET current_activity = ?, activity_expires_at = ?, busy_state = ?, busy_expires_at = ?,
                 summary_entries_json = ?, last_user_interaction_at = ?, last_assistant_speech_at = ?,
                 last_water_reminder_at = ?, last_check_in_at = ?, last_nap_suggestion_at = ?, water_cooldown_until = ?,
-                check_in_cooldown_until = ?, nap_cooldown_until = ?, updated_at = ?
+                check_in_cooldown_until = ?, nap_cooldown_until = ?, posture_monitoring_active = ?,
+                posture_workflow_active = ?, posture_session_id = ?, latest_posture_label = ?, latest_posture_severity = ?,
+                latest_posture_reason_codes_json = ?, latest_posture_metrics_json = ?, latest_posture_prompt_key = ?,
+                last_posture_event_at = ?, posture_issue_cooldowns_json = ?, posture_preview_enabled = ?,
+                posture_preview_active = ?, last_posture_callback_at = ?, last_posture_callback_event = ?,
+                posture_reminder_cooldown_seconds = ?, updated_at = ?
             WHERE id = 1
             """,
             (
@@ -1190,6 +1369,21 @@ class SQLiteVectorMemoryStore:
                 status.water_cooldown_until,
                 status.check_in_cooldown_until,
                 status.nap_cooldown_until,
+                int(status.posture_monitoring_active),
+                int(status.posture_workflow_active),
+                status.posture_session_id,
+                status.latest_posture_label,
+                status.latest_posture_severity,
+                json.dumps(status.latest_posture_reason_codes, ensure_ascii=False),
+                json.dumps(status.latest_posture_metrics, ensure_ascii=False),
+                status.latest_posture_prompt_key,
+                status.last_posture_event_at,
+                json.dumps(status.posture_issue_cooldowns, ensure_ascii=False),
+                int(status.posture_preview_enabled),
+                int(status.posture_preview_active),
+                status.last_posture_callback_at,
+                status.last_posture_callback_event,
+                status.posture_reminder_cooldown_seconds,
                 status.updated_at,
             ),
         )
@@ -1427,7 +1621,18 @@ class ContextController:
         )
         self._summary_max_entries = _env_int("STATUS_SUMMARY_MAX_ENTRIES", 6)
         self._summary_max_chars = _env_int("STATUS_SUMMARY_MAX_CHARS", 420)
+        self._posture_issue_cooldown_seconds = _env_float(
+            "POSTURE_ISSUE_REMINDER_COOLDOWN_SECONDS", 60.0
+        )
+        self._posture_event_stale_seconds = _env_float(
+            "POSTURE_EVENT_STALE_SECONDS", 30.0
+        )
         self._data_flow_logger = logging.getLogger("agent.data_flow")
+        if self.status.posture_reminder_cooldown_seconds <= 0:
+            self.status.posture_reminder_cooldown_seconds = (
+                self._posture_issue_cooldown_seconds
+            )
+            self.store.save_status(self.status)
         logger.info(
             "Context controller initialized",
             extra={
@@ -1437,6 +1642,9 @@ class ContextController:
                 "db_path": str(memory_db_path),
                 "post_user_grace_seconds": self._post_user_grace_seconds,
                 "post_assistant_grace_seconds": self._post_assistant_grace_seconds,
+                "posture_issue_cooldown_seconds": self._posture_issue_cooldown_seconds,
+                "stored_posture_reminder_cooldown_seconds": self.status.posture_reminder_cooldown_seconds,
+                "posture_event_stale_seconds": self._posture_event_stale_seconds,
             },
         )
 
@@ -1732,6 +1940,23 @@ class ContextController:
             )
         if self.status.current_activity:
             lines.append(f"- Current temporary activity: {self.status.current_activity}.")
+        if self.status.posture_monitoring_active:
+            lines.append("- Posture monitoring is active.")
+            lines.append(
+                f"- Posture coaching cadence: every {round(self.status.posture_reminder_cooldown_seconds / 60.0, 2)} minutes."
+            )
+            lines.append(
+                f"- Posture preview: enabled={self.status.posture_preview_enabled}, active={self.status.posture_preview_active}."
+            )
+            if self.status.latest_posture_label:
+                posture_bits = [self.status.latest_posture_label]
+                if self.status.latest_posture_reason_codes:
+                    posture_bits.append(", ".join(self.status.latest_posture_reason_codes))
+                lines.append(f"- Latest posture status: {' | '.join(posture_bits)}.")
+            if self.status.last_posture_callback_event:
+                lines.append(
+                    f"- Last posture callback: {self.status.last_posture_callback_event} at {self.status.last_posture_callback_at}."
+                )
 
         active_policies = []
         for reminder_type in KNOWN_REMINDER_TYPES:
@@ -1757,6 +1982,8 @@ class ContextController:
                 "preferred_name": self.profile.preferred_name,
                 "current_activity": self.status.current_activity,
                 "summary_chars": len(self.status.recent_summary),
+                "posture_preview_active": self.status.posture_preview_active,
+                "last_posture_callback_event": self.status.last_posture_callback_event,
             },
         )
         self._emit_data_flow(
@@ -1894,6 +2121,21 @@ class ContextController:
                 "water_cooldown_until": self.status.water_cooldown_until,
                 "check_in_cooldown_until": self.status.check_in_cooldown_until,
                 "nap_cooldown_until": self.status.nap_cooldown_until,
+                "posture_monitoring_active": self.status.posture_monitoring_active,
+                "posture_workflow_active": self.status.posture_workflow_active,
+                "posture_session_id": self.status.posture_session_id,
+                "latest_posture_label": self.status.latest_posture_label,
+                "latest_posture_severity": self.status.latest_posture_severity,
+                "latest_posture_reason_codes": list(self.status.latest_posture_reason_codes),
+                "latest_posture_metrics": dict(self.status.latest_posture_metrics),
+                "latest_posture_prompt_key": self.status.latest_posture_prompt_key,
+                "last_posture_event_at": self.status.last_posture_event_at,
+                "posture_preview_enabled": self.status.posture_preview_enabled,
+                "posture_preview_active": self.status.posture_preview_active,
+                "last_posture_callback_at": self.status.last_posture_callback_at,
+                "last_posture_callback_event": self.status.last_posture_callback_event,
+                "posture_reminder_cooldown_seconds": self.status.posture_reminder_cooldown_seconds,
+                "posture_issue_cooldowns": dict(self.status.posture_issue_cooldowns),
             },
             "policies": {
                 key: {
@@ -1914,6 +2156,8 @@ class ContextController:
                 "preferred_name": self.profile.preferred_name,
                 "current_activity": self.status.current_activity,
                 "recent_summary_chars": len(self.status.recent_summary),
+                "posture_preview_active": self.status.posture_preview_active,
+                "last_posture_callback_event": self.status.last_posture_callback_event,
             },
         )
         self._emit_data_flow("status_summary", summary=summary)
@@ -2057,6 +2301,33 @@ class ContextController:
             enabled=True,
             interval_minutes=normalized_interval,
         )
+
+    def set_posture_coaching_interval(self, interval_minutes: int | str) -> dict[str, Any]:
+        normalized_interval = _normalize_optional_int(
+            interval_minutes,
+            field_name="interval_minutes",
+            minimum=1,
+            maximum=24 * 60,
+        )
+        if normalized_interval is None:
+            raise ValueError("interval_minutes is required")
+        self.status.posture_reminder_cooldown_seconds = float(normalized_interval * 60)
+        self.store.save_status(self.status)
+        summary = self.status_summary()
+        logger.info(
+            "Posture coaching cadence updated",
+            extra={
+                "interval_minutes": normalized_interval,
+                "posture_reminder_cooldown_seconds": self.status.posture_reminder_cooldown_seconds,
+            },
+        )
+        self._emit_data_flow(
+            "status_posture_cadence_update",
+            interval_minutes=normalized_interval,
+            posture_reminder_cooldown_seconds=self.status.posture_reminder_cooldown_seconds,
+            summary=summary,
+        )
+        return summary
 
     def set_reminder_enabled(self, reminder_type: str, enabled: bool | str) -> dict[str, Any]:
         normalized_enabled = _normalize_optional_bool(enabled, field_name="enabled")
@@ -2269,6 +2540,185 @@ class ContextController:
         self._emit_data_flow("status_summary_cleared", summary=summary)
         return summary
 
+    def start_posture_monitoring(
+        self,
+        session_id: str,
+        *,
+        preview_enabled: bool = False,
+        preview_active: bool = False,
+    ) -> dict[str, Any]:
+        if not session_id.strip():
+            raise ValueError("session_id is required")
+        self.status.posture_monitoring_active = True
+        self.status.posture_workflow_active = True
+        self.status.posture_session_id = session_id.strip()
+        self.status.latest_posture_label = None
+        self.status.latest_posture_severity = None
+        self.status.latest_posture_reason_codes = []
+        self.status.latest_posture_metrics = {}
+        self.status.latest_posture_prompt_key = None
+        self.status.last_posture_event_at = None
+        self.status.posture_issue_cooldowns = {}
+        self.status.posture_preview_enabled = bool(preview_enabled)
+        self.status.posture_preview_active = bool(preview_active)
+        self.status.last_posture_callback_at = None
+        self.status.last_posture_callback_event = None
+        self.store.save_status(self.status)
+        summary = self.status_summary()
+        logger.info(
+            "Posture monitoring started",
+            extra={
+                "posture_session_id": self.status.posture_session_id,
+                "posture_preview_enabled": self.status.posture_preview_enabled,
+                "posture_preview_active": self.status.posture_preview_active,
+            },
+        )
+        self._emit_data_flow(
+            "posture_monitoring_started",
+            posture_session_id=self.status.posture_session_id,
+            posture_preview_enabled=self.status.posture_preview_enabled,
+            posture_preview_active=self.status.posture_preview_active,
+            summary=summary,
+        )
+        return summary
+
+    def stop_posture_monitoring(self) -> dict[str, Any]:
+        self.status.posture_monitoring_active = False
+        self.status.posture_workflow_active = False
+        self.status.posture_session_id = None
+        self.status.latest_posture_label = None
+        self.status.latest_posture_severity = None
+        self.status.latest_posture_reason_codes = []
+        self.status.latest_posture_metrics = {}
+        self.status.latest_posture_prompt_key = None
+        self.status.last_posture_event_at = None
+        self.status.posture_issue_cooldowns = {}
+        self.status.posture_preview_enabled = False
+        self.status.posture_preview_active = False
+        self.status.last_posture_callback_at = None
+        self.status.last_posture_callback_event = None
+        self.store.save_status(self.status)
+        summary = self.status_summary()
+        logger.info("Posture monitoring stopped")
+        self._emit_data_flow("posture_monitoring_stopped", summary=summary)
+        return summary
+
+    def posture_monitoring_status(self) -> dict[str, Any]:
+        runtime = self.status_summary()["runtime"]
+        result = {
+            "active": runtime["posture_monitoring_active"],
+            "workflow_active": runtime["posture_workflow_active"],
+            "session_id": runtime["posture_session_id"],
+            "latest_posture_label": runtime["latest_posture_label"],
+            "latest_posture_severity": runtime["latest_posture_severity"],
+            "latest_posture_reason_codes": runtime["latest_posture_reason_codes"],
+            "latest_posture_metrics": runtime["latest_posture_metrics"],
+            "latest_posture_prompt_key": runtime["latest_posture_prompt_key"],
+            "last_posture_event_at": runtime["last_posture_event_at"],
+            "preview_enabled": runtime["posture_preview_enabled"],
+            "preview_active": runtime["posture_preview_active"],
+            "last_callback_at": runtime["last_posture_callback_at"],
+            "last_callback_event": runtime["last_posture_callback_event"],
+            "coaching_interval_seconds": runtime["posture_reminder_cooldown_seconds"],
+            "coaching_interval_minutes": round(
+                float(runtime["posture_reminder_cooldown_seconds"]) / 60.0,
+                2,
+            ),
+        }
+        logger.info(
+            "Posture monitoring status prepared",
+            extra={"active": result["active"], "session_id": result["session_id"]},
+        )
+        self._emit_data_flow("posture_monitoring_status", status=result)
+        return result
+
+    def ingest_posture_event(
+        self,
+        *,
+        session_id: str,
+        event_name: str,
+        timestamp: str | None = None,
+        severity: str | None = None,
+        posture_label: str | None = None,
+        reason_codes: list[str] | None = None,
+        metrics: dict[str, Any] | None = None,
+        prompt_key: str | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_session_id = session_id.strip()
+        if not self.status.posture_monitoring_active or self.status.posture_session_id != normalized_session_id:
+            logger.info(
+                "Ignoring posture event for inactive or mismatched session",
+                extra={
+                    "posture_session_id": self.status.posture_session_id,
+                    "incoming_session_id": normalized_session_id,
+                    "event_name": event_name,
+                },
+            )
+            return {"accepted": False, "reason": "session_mismatch"}
+        normalized_event = event_name.strip().lower()
+        normalized_reasons = [
+            str(code).strip().replace("_", " ").lower()
+            for code in (reason_codes or [])
+            if str(code).strip()
+        ]
+        normalized_metrics = {
+            str(key): float(value)
+            for key, value in (metrics or {}).items()
+            if isinstance(value, (int, float))
+        }
+        callback_received_at = time.time()
+        self.status.last_posture_event_at = callback_received_at
+        self.status.last_posture_callback_at = callback_received_at
+        self.status.last_posture_callback_event = normalized_event
+        if normalized_event == "posture.normal":
+            self.status.latest_posture_label = "standard"
+            self.status.latest_posture_severity = "normal"
+            self.status.latest_posture_reason_codes = []
+            self.status.latest_posture_metrics = normalized_metrics
+            self.status.latest_posture_prompt_key = prompt_key
+        elif normalized_event == "camera.error":
+            self.status.latest_posture_label = "insufficient_data"
+            self.status.latest_posture_severity = severity or "warning"
+            self.status.latest_posture_reason_codes = normalized_reasons or ["camera error"]
+            self.status.latest_posture_metrics = normalized_metrics
+            self.status.latest_posture_prompt_key = prompt_key or "remind_adjust_camera"
+        elif normalized_event == "session.stopped":
+            self.status.posture_monitoring_active = False
+            self.status.posture_workflow_active = False
+            self.status.posture_preview_active = False
+        else:
+            self.status.latest_posture_label = posture_label or "needs_adjustment"
+            self.status.latest_posture_severity = severity or "mild"
+            self.status.latest_posture_reason_codes = normalized_reasons
+            self.status.latest_posture_metrics = normalized_metrics
+            self.status.latest_posture_prompt_key = prompt_key
+        self.store.save_status(self.status)
+        result = {
+            "accepted": True,
+            "session_id": normalized_session_id,
+            "event_name": normalized_event,
+            "latest_posture_label": self.status.latest_posture_label,
+            "latest_posture_severity": self.status.latest_posture_severity,
+            "latest_posture_reason_codes": list(self.status.latest_posture_reason_codes),
+            "latest_posture_metrics": dict(self.status.latest_posture_metrics),
+            "message": message,
+            "timestamp": timestamp,
+        }
+        logger.info(
+            "Posture event ingested",
+            extra={
+                "event_name": normalized_event,
+                "posture_session_id": normalized_session_id,
+                "latest_posture_label": self.status.latest_posture_label,
+                "latest_posture_severity": self.status.latest_posture_severity,
+                "last_posture_callback_at": self.status.last_posture_callback_at,
+                "last_posture_callback_event": self.status.last_posture_callback_event,
+            },
+        )
+        self._emit_data_flow("posture_runtime_updated", result=result, runtime=self._runtime_for_log())
+        return result
+
     def daily_status(self, day: str) -> dict[str, Any]:
         resolved = self._resolve_day(day)
         status = self.store.get_daily_status(resolved) or DailyStatus(day=resolved)
@@ -2338,6 +2788,83 @@ class ContextController:
                 return "post_assistant_grace"
         return None
 
+    def _next_posture_action(self, *, now_ts: float) -> ProactiveAction | None:
+        if not self.status.posture_monitoring_active:
+            self._emit_data_flow(
+                "posture_reminder_decision",
+                decision="skip",
+                reason="monitoring_inactive",
+                runtime=self._runtime_for_log(),
+            )
+            return None
+        if self.status.last_posture_event_at is None:
+            self._emit_data_flow(
+                "posture_reminder_decision",
+                decision="skip",
+                reason="no_posture_event",
+                runtime=self._runtime_for_log(),
+            )
+            return None
+        if now_ts - self.status.last_posture_event_at > self._posture_event_stale_seconds:
+            self._emit_data_flow(
+                "posture_reminder_decision",
+                decision="skip",
+                reason="stale_event",
+                event_age_seconds=round(now_ts - self.status.last_posture_event_at, 2),
+                stale_after_seconds=self._posture_event_stale_seconds,
+                runtime=self._runtime_for_log(),
+            )
+            return None
+        posture_label = self.status.latest_posture_label
+        if posture_label in {None, "standard"}:
+            self._emit_data_flow(
+                "posture_reminder_decision",
+                decision="skip",
+                reason="posture_standard",
+                posture_label=posture_label,
+                runtime=self._runtime_for_log(),
+            )
+            return None
+        issue_key = _normalize_posture_issue_key(
+            reason_codes=self.status.latest_posture_reason_codes,
+            prompt_key=self.status.latest_posture_prompt_key,
+            posture_label=posture_label,
+        )
+        cooldown_until = self.status.posture_issue_cooldowns.get(issue_key)
+        if cooldown_until is not None and now_ts < cooldown_until:
+            logger.info(
+                "Posture reminder skipped due to cooldown",
+                extra={"issue_key": issue_key, "cooldown_until": cooldown_until},
+            )
+            self._emit_data_flow(
+                "posture_reminder_decision",
+                decision="skip",
+                reason="cooldown_active",
+                issue_key=issue_key,
+                cooldown_until=cooldown_until,
+                runtime=self._runtime_for_log(),
+            )
+            return None
+        text = _posture_guidance_text(issue_key)
+        logger.info(
+            "Posture reminder due",
+            extra={"issue_key": issue_key, "text": text, "posture_label": posture_label},
+        )
+        self._emit_data_flow(
+            "posture_reminder_decision",
+            decision="speak",
+            issue_key=issue_key,
+            posture_label=posture_label,
+            latest_posture_reason_codes=list(self.status.latest_posture_reason_codes),
+            latest_posture_prompt_key=self.status.latest_posture_prompt_key,
+            text=text,
+        )
+        return ProactiveAction(
+            reminder_type=f"posture:{issue_key}",
+            mode="say",
+            text=text,
+        )
+
     def next_proactive_action(self, *, now: datetime | None = None) -> ProactiveAction | None:
         now_dt = now or datetime.now(UTC)
         now_ts = now_dt.timestamp()
@@ -2348,6 +2875,9 @@ class ContextController:
         if not self.is_recently_active(now=now_ts):
             logger.info("Proactive action skipped", extra={"reason": "inactive_user"})
             return None
+        posture_action = self._next_posture_action(now_ts=now_ts)
+        if posture_action is not None:
+            return posture_action
         now_local = _now_in_timezone(self.profile.timezone, now=now_dt)
         day = now_local.date().isoformat()
         today = self.store.ensure_daily_row(day)
@@ -2485,6 +3015,29 @@ class ContextController:
             runtime=self._runtime_for_log(),
         )
 
+    def record_posture_reminder_sent(self, reminder_type: str, *, now: datetime | None = None) -> None:
+        now_dt = now or datetime.now(UTC)
+        now_ts = now_dt.timestamp()
+        issue_key = reminder_type.split(":", 1)[1] if ":" in reminder_type else reminder_type
+        self.status.posture_issue_cooldowns[issue_key] = (
+            now_ts + self.status.posture_reminder_cooldown_seconds
+        )
+        self.store.save_status(self.status)
+        logger.info(
+            "Posture reminder recorded",
+            extra={
+                "issue_key": issue_key,
+                "cooldown_until": self.status.posture_issue_cooldowns[issue_key],
+                "posture_reminder_cooldown_seconds": self.status.posture_reminder_cooldown_seconds,
+            },
+        )
+        self._emit_data_flow(
+            "posture_reminder_spoken",
+            issue_key=issue_key,
+            cooldown_until=self.status.posture_issue_cooldowns[issue_key],
+            runtime=self._runtime_for_log(),
+        )
+
     def _profile_for_log(self) -> dict[str, Any]:
         return {
             "preferred_name": self.profile.preferred_name,
@@ -2508,6 +3061,21 @@ class ContextController:
             "water_cooldown_until": self.status.water_cooldown_until,
             "check_in_cooldown_until": self.status.check_in_cooldown_until,
             "nap_cooldown_until": self.status.nap_cooldown_until,
+            "posture_monitoring_active": self.status.posture_monitoring_active,
+            "posture_workflow_active": self.status.posture_workflow_active,
+            "posture_session_id": self.status.posture_session_id,
+            "latest_posture_label": self.status.latest_posture_label,
+            "latest_posture_severity": self.status.latest_posture_severity,
+            "latest_posture_reason_codes": list(self.status.latest_posture_reason_codes),
+            "latest_posture_metrics": dict(self.status.latest_posture_metrics),
+            "latest_posture_prompt_key": self.status.latest_posture_prompt_key,
+            "last_posture_event_at": self.status.last_posture_event_at,
+            "posture_preview_enabled": self.status.posture_preview_enabled,
+            "posture_preview_active": self.status.posture_preview_active,
+            "last_posture_callback_at": self.status.last_posture_callback_at,
+            "last_posture_callback_event": self.status.last_posture_callback_event,
+            "posture_reminder_cooldown_seconds": self.status.posture_reminder_cooldown_seconds,
+            "posture_issue_cooldowns": dict(self.status.posture_issue_cooldowns),
         }
 
     def _policies_for_log(self) -> dict[str, Any]:
@@ -2573,6 +3141,9 @@ class DisabledContextController:
     def set_check_in_interval(self, interval_minutes: int | str) -> dict[str, Any]:
         return {}
 
+    def set_posture_coaching_interval(self, interval_minutes: int | str) -> dict[str, Any]:
+        return {}
+
     def set_reminder_enabled(self, reminder_type: str, enabled: bool | str) -> dict[str, Any]:
         return {}
 
@@ -2614,6 +3185,24 @@ class DisabledContextController:
     def clear_recent_summary(self) -> dict[str, Any]:
         return {}
 
+    def start_posture_monitoring(
+        self,
+        session_id: str,
+        *,
+        preview_enabled: bool = False,
+        preview_active: bool = False,
+    ) -> dict[str, Any]:
+        return {}
+
+    def stop_posture_monitoring(self) -> dict[str, Any]:
+        return {}
+
+    def posture_monitoring_status(self) -> dict[str, Any]:
+        return {}
+
+    def ingest_posture_event(self, **kwargs: Any) -> dict[str, Any]:
+        return {}
+
     def daily_status(self, day: str) -> dict[str, Any]:
         return {}
 
@@ -2633,6 +3222,9 @@ class DisabledContextController:
         *,
         now: datetime | None = None,
     ) -> None:
+        return None
+
+    def record_posture_reminder_sent(self, reminder_type: str, *, now: datetime | None = None) -> None:
         return None
 
     def is_recently_active(self, *, now: float | None = None) -> bool:

@@ -160,6 +160,10 @@ For the structured status, reminder, proactive scheduler, and human test checkli
 
 For a general end-user guide covering everyday voice commands, reminders, memory, Sense HAT questions, and troubleshooting, use [docs/user-manual.md](docs/user-manual.md).
 
+For the posture monitoring service integration and callback design, use [docs/posture-integration.md](docs/posture-integration.md).
+
+For a developer-focused review of the posture work, including runtime architecture, code walkthrough, debugging history, and follow-up guidance, use [docs/posture-dev-review.md](docs/posture-dev-review.md).
+
 ## Self-hosted LiveKit
 
 You can also self-host LiveKit instead of using LiveKit Cloud. See the [self-hosting](https://docs.livekit.io/transport/self-hosting/local/) guide for more information. If you choose to self-host, you'll need to also use [model plugins](https://docs.livekit.io/agents/models/#plugins) instead of LiveKit Inference and will need to remove the [LiveKit Cloud noise cancellation](https://docs.livekit.io/transport/media/noise-cancellation/) plugin.

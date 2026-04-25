@@ -13,6 +13,7 @@ The agent can:
 - proactively remind you about things like drinking water
 - suggest a short nap in the afternoon
 - check in with you from time to time
+- coach your posture while you are working
 - let you inspect, change, clear, and reset reminder and status settings
 
 ## Important Behavior To Know
@@ -71,6 +72,52 @@ The agent currently supports:
 - drink water reminders
 - afternoon nap suggestions
 - proactive check-ins
+- posture coaching while monitoring is active
+
+## Posture Help
+
+The agent can work with the local posture detection service on the Raspberry Pi and give short spoken coaching when your posture slips while you are working.
+
+### Start posture monitoring
+
+Say things like:
+
+- `help me check my posture while I work`
+- `start posture monitoring`
+- `watch my posture`
+
+### Stop posture monitoring
+
+Say things like:
+
+- `stop posture monitoring`
+- `stop posture help`
+- `do not coach my posture anymore`
+
+### Check posture monitoring status
+
+Say things like:
+
+- `is posture monitoring on`
+- `what is my current posture status`
+- `what posture issue did you see`
+
+### What the reminders sound like
+
+The agent may say short cues such as:
+
+- `Bring your head back a little and straighten your neck.`
+- `Sit taller and straighten your back.`
+- `I cannot read your posture clearly. Please adjust the camera angle or lighting.`
+
+### Camera placement tips
+
+For the best posture monitoring:
+
+- place the camera where your upper body and head are visible
+- keep the camera roughly level with your chest or face
+- avoid strong backlighting
+- stay inside the frame while working
 
 ### Change reminder timing
 
@@ -196,6 +243,7 @@ Examples:
 - current sensor values depend on a successful live tool call
 - if speech recognition mishears a device term, the correction layer may still miss it sometimes
 - proactive reminders only happen when the session is active and the gating rules allow it
+- posture coaching only works when the local posture detection service is running and posture monitoring is active
 - the agent can clear structured status history, but long-run memory facts are managed through separate memory tools
 
 ## Troubleshooting

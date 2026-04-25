@@ -347,6 +347,166 @@ async def test_clear_recent_summary_and_delete_daily_status(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_posture_monitoring_lifecycle_and_status(tmp_path):
+    controller = ContextController(
+        store=SQLiteVectorMemoryStore(tmp_path / "memory.sqlite3"),
+        embedder=FailingEmbedder(),
+    )
+
+    started = controller.start_posture_monitoring(
+        "posture-123",
+        preview_enabled=True,
+        preview_active=True,
+    )
+
+    assert started["runtime"]["posture_monitoring_active"] is True
+    assert started["runtime"]["posture_session_id"] == "posture-123"
+    assert started["runtime"]["posture_preview_enabled"] is True
+    assert started["runtime"]["posture_preview_active"] is True
+
+    status = controller.posture_monitoring_status()
+    assert status["active"] is True
+    assert status["session_id"] == "posture-123"
+    assert status["preview_enabled"] is True
+    assert status["preview_active"] is True
+
+    stopped = controller.stop_posture_monitoring()
+    assert stopped["runtime"]["posture_monitoring_active"] is False
+    assert stopped["runtime"]["posture_session_id"] is None
+    assert stopped["runtime"]["posture_preview_active"] is False
+
+
+@pytest.mark.asyncio
+async def test_ingest_posture_warning_updates_runtime(tmp_path):
+    controller = ContextController(
+        store=SQLiteVectorMemoryStore(tmp_path / "memory.sqlite3"),
+        embedder=FailingEmbedder(),
+    )
+    controller.start_posture_monitoring("posture-123")
+
+    result = controller.ingest_posture_event(
+        session_id="posture-123",
+        event_name="posture.warning",
+        severity="moderate",
+        posture_label="warning",
+        reason_codes=["forward head"],
+        metrics={"head_offset_px": 18.5},
+        prompt_key="remind_straighten_neck",
+    )
+
+    assert result["accepted"] is True
+    assert result["latest_posture_label"] == "warning"
+    assert result["latest_posture_reason_codes"] == ["forward head"]
+    assert result["latest_posture_metrics"] == {"head_offset_px": 18.5}
+    status = controller.posture_monitoring_status()
+    assert status["last_callback_event"] == "posture.warning"
+    assert status["last_callback_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_set_posture_coaching_interval_updates_runtime(tmp_path):
+    controller = ContextController(
+        store=SQLiteVectorMemoryStore(tmp_path / "memory.sqlite3"),
+        embedder=FailingEmbedder(),
+    )
+
+    summary = controller.set_posture_coaching_interval(2)
+
+    assert summary["runtime"]["posture_reminder_cooldown_seconds"] == 120.0
+
+
+@pytest.mark.asyncio
+async def test_ingest_posture_normal_updates_runtime_without_error(tmp_path):
+    controller = ContextController(
+        store=SQLiteVectorMemoryStore(tmp_path / "memory.sqlite3"),
+        embedder=FailingEmbedder(),
+    )
+    controller.start_posture_monitoring("posture-123")
+
+    result = controller.ingest_posture_event(
+        session_id="posture-123",
+        event_name="posture.normal",
+        metrics={"torso_angle_deg": 5.0},
+    )
+
+    assert result["accepted"] is True
+    assert result["latest_posture_label"] == "standard"
+    assert result["latest_posture_severity"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_posture_events_ignore_mismatched_session(tmp_path):
+    controller = ContextController(
+        store=SQLiteVectorMemoryStore(tmp_path / "memory.sqlite3"),
+        embedder=FailingEmbedder(),
+    )
+    controller.start_posture_monitoring("posture-123")
+
+    result = controller.ingest_posture_event(
+        session_id="other-session",
+        event_name="posture.warning",
+    )
+
+    assert result == {"accepted": False, "reason": "session_mismatch"}
+
+
+@pytest.mark.asyncio
+async def test_posture_warning_drives_specific_proactive_action(tmp_path):
+    controller = ContextController(
+        store=SQLiteVectorMemoryStore(tmp_path / "memory.sqlite3"),
+        embedder=FailingEmbedder(),
+    )
+    controller.start_posture_monitoring("posture-123")
+    controller.status.last_user_interaction_at = datetime.now(timezone.utc).timestamp()
+    controller.store.save_status(controller.status)
+    controller.ingest_posture_event(
+        session_id="posture-123",
+        event_name="posture.warning",
+        severity="moderate",
+        posture_label="warning",
+        reason_codes=["rounded back"],
+        metrics={"torso_angle_deg": 14.0},
+    )
+
+    action = controller.next_proactive_action()
+
+    assert action is not None
+    assert action.reminder_type == "posture:back_alignment"
+    assert "straighten your back" in (action.text or "")
+
+
+@pytest.mark.asyncio
+async def test_posture_reminder_cooldown_blocks_repeat_actions(tmp_path):
+    controller = ContextController(
+        store=SQLiteVectorMemoryStore(tmp_path / "memory.sqlite3"),
+        embedder=FailingEmbedder(),
+    )
+    controller.start_posture_monitoring("posture-123")
+    controller.policies["drink_water"].enabled = False
+    controller.store.save_reminder_policy(controller.policies["drink_water"])
+    controller.policies["check_in"].enabled = False
+    controller.store.save_reminder_policy(controller.policies["check_in"])
+    now = datetime(2026, 4, 23, 9, 0, tzinfo=timezone.utc)
+    controller.status.last_user_interaction_at = now.timestamp()
+    controller.store.save_status(controller.status)
+    controller.ingest_posture_event(
+        session_id="posture-123",
+        event_name="posture.warning",
+        severity="moderate",
+        posture_label="warning",
+        reason_codes=["forward head"],
+        metrics={"head_offset_px": 18.0},
+    )
+
+    first = controller.next_proactive_action(now=now)
+    assert first is not None
+    controller.record_posture_reminder_sent(first.reminder_type, now=now)
+
+    second = controller.next_proactive_action(now=now)
+    assert second is None
+
+
+@pytest.mark.asyncio
 async def test_context_controller_next_proactive_action_respects_quiet_hours(tmp_path):
     controller = ContextController(
         store=SQLiteVectorMemoryStore(tmp_path / "memory.sqlite3"),
